@@ -1,0 +1,1473 @@
+# Setup ----
+
+## Working directory ----
+
+setwd("C:/Users/Jeffrey Castanon/San Diego Association of Governments/Data Science - Documents/Economics/FY2025_26 Projects/Misc Projects/0626_PeMS Station Data")
+setwd("C:/Users/jcast/San Diego Association of Governments/Data Science - Documents/Economics/FY2025_26 Projects/Misc Projects/0626_PeMS Station Data")
+
+
+## Libraries ----
+
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(writexl)
+
+options(na.print = "NA")
+
+
+# Output folder ----
+
+output_dir <- "2_Data Cleaning"
+analysis_output_dir <- file.path(output_dir, "analysis_outputs")
+
+dir.create(analysis_output_dir, showWarnings = FALSE, recursive = TRUE)
+
+
+# Read master dataframe ----
+
+master_rds_path <- file.path(output_dir, "i15_master_clean.rds")
+
+i15_master_clean <- readRDS(master_rds_path) %>%
+  mutate(
+    facility = factor(facility, levels = c("GP", "Managed Lane")),
+    tod = factor(tod, levels = c("AM Peak", "PM Peak", "Off-Peak"))
+  )
+
+cat("\nMaster dataframe read successfully:\n")
+
+i15_master_clean %>%
+  summarise(
+    rows = n(),
+    first_timestamp = min(ts, na.rm = TRUE),
+    last_timestamp = max(ts, na.rm = TRUE),
+    stations = n_distinct(station_id),
+    months = n_distinct(month)
+  ) %>%
+  print()
+
+
+# Analysis controls ----
+
+## These can be adjusted later without rebuilding the master dataframe.
+
+weekdays_only <- TRUE
+
+min_hour_pct_observed <- 75
+health_threshold <- 0.75
+
+
+# Helper functions ----
+
+weighted_speed <- function(speed, flow) {
+  
+  good <- !is.na(speed) & !is.na(flow) & flow > 0
+  
+  if (!any(good)) {
+    return(NA_real_)
+  }
+  
+  weighted.mean(speed[good], w = flow[good])
+}
+
+
+print_table <- function(title, data, n = 50) {
+  
+  cat("\n", title, "\n", sep = "")
+  base::print(as.data.frame(head(data, n)), row.names = FALSE)
+}
+
+
+safe_min <- function(x) {
+  if (all(is.na(x))) {
+    return(NA_real_)
+  }
+  min(x, na.rm = TRUE)
+}
+
+
+safe_median <- function(x) {
+  if (all(is.na(x))) {
+    return(NA_real_)
+  }
+  median(x, na.rm = TRUE)
+}
+
+
+safe_mean <- function(x) {
+  if (all(is.na(x))) {
+    return(NA_real_)
+  }
+  mean(x, na.rm = TRUE)
+}
+
+
+safe_first_character <- function(x) {
+  
+  x <- x[!is.na(x) & x != ""]
+  
+  if (length(x) == 0) {
+    return(NA_character_)
+  }
+  
+  x[1]
+}
+
+
+# Analysis base ----
+
+## Apply weekday filter and refresh record-quality fields using current assumptions.
+
+i15_analysis_base <- i15_master_clean %>%
+  filter(
+    if (weekdays_only) is_weekday else TRUE
+  ) %>%
+  mutate(
+    valid_speed = !is.na(avg_speed_mph) & avg_speed_mph > 0,
+    valid_volume = !is.na(total_flow_vph) & total_flow_vph >= 0,
+    reported_record =
+      !is.na(pct_observed) &
+      pct_observed >= min_hour_pct_observed &
+      !is.na(samples) &
+      samples > 0,
+    complete_record =
+      reported_record &
+      valid_speed &
+      valid_volume
+  )
+
+
+analysis_base_summary <- i15_analysis_base %>%
+  summarise(
+    rows = n(),
+    first_date = min(date, na.rm = TRUE),
+    last_date = max(date, na.rm = TRUE),
+    stations = n_distinct(station_id),
+    months = n_distinct(month),
+    complete_record_share = mean(complete_record, na.rm = TRUE)
+  )
+
+print_table("Analysis base summary:", analysis_base_summary)
+
+
+# Station health ----
+
+## Healthy stations have complete records for at least the selected share
+## of expected weekday station-hours.
+
+station_health_parameters <- tibble(
+  parameter = c(
+    "Minimum observed share for usable station-hour",
+    "Minimum complete-record share for healthy station"
+  ),
+  value = c(
+    paste0(min_hour_pct_observed, "%"),
+    paste0(health_threshold * 100, "%")
+  )
+)
+
+print_table("Station health parameters:", station_health_parameters)
+
+
+analysis_hours <- i15_analysis_base %>%
+  distinct(ts, month) %>%
+  arrange(ts)
+
+analysis_hour_vec <- sort(unique(analysis_hours$ts))
+
+
+count_expected_hours_from_data <- function(start_ts, end_ts, hour_vec) {
+  
+  if (is.na(start_ts) || is.na(end_ts) || end_ts < start_ts) {
+    return(NA_integer_)
+  }
+  
+  sum(hour_vec >= start_ts & hour_vec <= end_ts)
+}
+
+
+station_health_detail <- i15_analysis_base %>%
+  group_by(direction, direction_label, facility, station_id) %>%
+  summarise(
+    first_ts = min(ts, na.rm = TRUE),
+    last_ts = max(ts, na.rm = TRUE),
+    
+    records_present = n_distinct(ts),
+    reported_records = n_distinct(ts[reported_record]),
+    complete_records = n_distinct(ts[complete_record]),
+    
+    avg_pct_observed = safe_mean(pct_observed),
+    median_pct_observed = safe_median(pct_observed),
+    min_pct_observed = safe_min(pct_observed),
+    
+    station_length_mi = safe_median(station_length_mi),
+    corridor_mile = safe_median(corridor_mile),
+    latitude = safe_median(latitude),
+    longitude = safe_median(longitude),
+    station_name = safe_first_character(station_name),
+    
+    .groups = "drop"
+  ) %>%
+  rowwise() %>%
+  mutate(
+    expected_records = count_expected_hours_from_data(
+      start_ts = first_ts,
+      end_ts = last_ts,
+      hour_vec = analysis_hour_vec
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    share_records_present = records_present / expected_records,
+    share_reported = reported_records / expected_records,
+    share_complete = complete_records / expected_records,
+    healthy_station = share_complete >= health_threshold
+  ) %>%
+  arrange(direction, facility, corridor_mile, station_id)
+
+
+station_health_summary <- station_health_detail %>%
+  group_by(direction, direction_label, facility) %>%
+  summarise(
+    stations_total = n_distinct(station_id),
+    
+    healthy_stations = sum(
+      healthy_station,
+      na.rm = TRUE
+    ),
+    
+    unhealthy_stations =
+      stations_total - healthy_stations,
+    
+    share_healthy =
+      healthy_stations / stations_total,
+    
+    avg_share_complete = mean(
+      share_complete,
+      na.rm = TRUE
+    ),
+    
+    stations_share_complete_75 = sum(
+      share_complete >= health_threshold,
+      na.rm = TRUE
+    ),
+    
+    stations_pct_observed_75 = sum(
+      avg_pct_observed >= min_hour_pct_observed,
+      na.rm = TRUE
+    ),
+    
+    group_avg_pct_observed = mean(
+      avg_pct_observed,
+      na.rm = TRUE
+    ),
+    
+    .groups = "drop"
+  ) %>%
+  arrange(direction, facility)
+
+print_table("Station health summary:", station_health_summary)
+
+write.csv(station_health_summary, "4_Outputs/station_health_summary.csv")
+# Healthy station location table ----
+
+## This table documents where the usable data is coming from.
+## It is station-level and includes postmile and station name.
+
+healthy_station_location_table <- station_health_detail %>%
+  filter(healthy_station) %>%
+  transmute(
+    direction,
+    direction_label,
+    facility,
+    station_id,
+    post_mile = corridor_mile,
+    station_name,
+    share_complete,
+    avg_pct_observed,
+    latitude,
+    longitude
+  ) %>%
+  arrange(direction, facility, post_mile, station_id)
+
+print_table("Healthy station location table:", healthy_station_location_table, n = 150)
+
+
+# Select nearest GP stations to managed-lane stations ----
+
+## For each healthy managed-lane station, select the closest healthy GP station
+## in the same direction using corridor mile / postmile.
+
+ml_stations <- healthy_station_location_table %>%
+  filter(facility == "Managed Lane") %>%
+  select(
+    direction,
+    direction_label,
+    ml_station_id = station_id,
+    ml_post_mile = post_mile,
+    ml_station_name = station_name,
+    ml_share_complete = share_complete,
+    ml_avg_pct_observed = avg_pct_observed
+  )
+
+
+gp_stations <- healthy_station_location_table %>%
+  filter(facility == "GP") %>%
+  select(
+    direction,
+    direction_label,
+    gp_station_id = station_id,
+    gp_post_mile = post_mile,
+    gp_station_name = station_name,
+    gp_share_complete = share_complete,
+    gp_avg_pct_observed = avg_pct_observed
+  )
+
+
+closest_gp_to_ml <- ml_stations %>%
+  inner_join(
+    gp_stations,
+    by = c("direction", "direction_label")
+  ) %>%
+  mutate(
+    station_distance_mi = abs(ml_post_mile - gp_post_mile)
+  ) %>%
+  group_by(direction, direction_label, ml_station_id) %>%
+  slice_min(station_distance_mi, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(direction, ml_post_mile)
+
+print_table("Closest GP station to each managed-lane station:", closest_gp_to_ml, n = 100)
+
+
+## Build selected station table.
+## Managed-lane stations are retained.
+## GP stations are limited to the nearest healthy GP station for each managed-lane station.
+
+selected_station_keys <- bind_rows(
+  closest_gp_to_ml %>%
+    transmute(
+      direction,
+      facility = "Managed Lane",
+      station_id = ml_station_id
+    ),
+  closest_gp_to_ml %>%
+    transmute(
+      direction,
+      facility = "GP",
+      station_id = gp_station_id
+    )
+) %>%
+  distinct() %>%
+  mutate(
+    facility = factor(facility, levels = c("GP", "Managed Lane"))
+  )
+
+
+selected_station_table <- healthy_station_location_table %>%
+  semi_join(
+    selected_station_keys,
+    by = c("direction", "facility", "station_id")
+  ) %>%
+  arrange(direction, facility, post_mile, station_id)
+
+print_table("Selected stations for analysis:", selected_station_table, n = 100)
+
+
+# Selected station analysis base ----
+
+## The main comparison uses only managed-lane stations and their nearest GP station.
+
+i15_selected <- i15_analysis_base %>%
+  semi_join(
+    selected_station_keys,
+    by = c("direction", "facility", "station_id")
+  ) %>%
+  filter(complete_record)
+
+
+selected_analysis_summary <- i15_selected %>%
+  group_by(direction, direction_label, facility) %>%
+  summarise(
+    rows = n(),
+    stations = n_distinct(station_id),
+    min_post_mile = min(corridor_mile, na.rm = TRUE),
+    max_post_mile = max(corridor_mile, na.rm = TRUE),
+    days_observed = n_distinct(date),
+    .groups = "drop"
+  ) %>%
+  arrange(direction, facility)
+
+print_table("Selected station analysis base summary:", selected_analysis_summary)
+
+
+# ADT and speed summary ----
+
+## ADT is calculated as average daily station volume.
+## Speed is volume-weighted.
+
+selected_station_daily_summary <- i15_selected %>%
+  group_by(date, direction, direction_label, facility, station_id, corridor_mile, station_name) %>%
+  summarise(
+    station_daily_volume = sum(total_flow_vph, na.rm = TRUE),
+    station_daily_speed = weighted_speed(avg_speed_mph, total_flow_vph),
+    .groups = "drop"
+  )
+
+
+selected_adt_summary <- selected_station_daily_summary %>%
+  group_by(direction, direction_label, facility) %>%
+  summarise(
+    avg_adt_per_station = mean(station_daily_volume, na.rm = TRUE),
+    avg_daily_speed_mph = weighted_speed(station_daily_speed, station_daily_volume),
+    stations_used = n_distinct(station_id),
+    days_observed = n_distinct(date),
+    .groups = "drop"
+  ) %>%
+  arrange(direction, facility)
+
+print_table("Selected station ADT and speed summary:", selected_adt_summary)
+
+
+selected_adt_compare <- selected_adt_summary %>%
+  select(
+    direction,
+    direction_label,
+    facility,
+    avg_adt_per_station,
+    avg_daily_speed_mph,
+    stations_used
+  ) %>%
+  pivot_wider(
+    names_from = facility,
+    values_from = c(
+      avg_adt_per_station,
+      avg_daily_speed_mph,
+      stations_used
+    )
+  ) %>%
+  clean_names() %>%
+  arrange(direction)
+
+print_table("Selected station managed lane vs GP ADT comparison:", selected_adt_compare)
+
+
+# Time-of-day performance summary ----
+
+## Time-of-day comparison by direction and facility.
+## Average hourly volume is included because time-of-day periods have different lengths.
+
+selected_station_tod_summary <- i15_selected %>%
+  group_by(
+    direction,
+    direction_label,
+    facility,
+    station_id,
+    corridor_mile,
+    station_name,
+    tod
+  ) %>%
+  summarise(
+    avg_speed_mph = weighted_speed(avg_speed_mph, total_flow_vph),
+    avg_travel_time_min_per_mile = 60 / avg_speed_mph,
+    total_volume = sum(total_flow_vph, na.rm = TRUE),
+    avg_hourly_volume_vph = mean(total_flow_vph, na.rm = TRUE),
+    avg_daily_period_volume =
+      sum(total_flow_vph, na.rm = TRUE) / n_distinct(date),
+    station_hours = n_distinct(ts),
+    days_observed = n_distinct(date),
+    .groups = "drop"
+  ) %>%
+  arrange(direction, facility, corridor_mile, tod)
+
+print_table("Selected station time-of-day summary:", selected_station_tod_summary, n = 150)
+
+
+selected_tod_summary <- selected_station_tod_summary %>%
+  group_by(direction, direction_label, facility, tod) %>%
+  summarise(
+    avg_speed_mph = weighted_speed(avg_speed_mph, total_volume),
+    avg_travel_time_min_per_mile = 60 / avg_speed_mph,
+    avg_hourly_volume_per_station =
+      weighted.mean(avg_hourly_volume_vph, w = station_hours, na.rm = TRUE),
+    avg_daily_period_volume_per_station =
+      mean(avg_daily_period_volume, na.rm = TRUE),
+    stations_used = n_distinct(station_id),
+    .groups = "drop"
+  ) %>%
+  arrange(direction, facility, tod)
+
+print_table("Selected station time-of-day performance summary:", selected_tod_summary)
+
+
+selected_tod_compare <- selected_tod_summary %>%
+  select(
+    direction,
+    direction_label,
+    tod,
+    facility,
+    avg_speed_mph,
+    avg_travel_time_min_per_mile,
+    avg_hourly_volume_per_station,
+    avg_daily_period_volume_per_station,
+    stations_used
+  ) %>%
+  pivot_wider(
+    names_from = facility,
+    values_from = c(
+      avg_speed_mph,
+      avg_travel_time_min_per_mile,
+      avg_hourly_volume_per_station,
+      avg_daily_period_volume_per_station,
+      stations_used
+    )
+  ) %>%
+  clean_names() %>%
+  mutate(
+    managed_minus_gp_speed_mph =
+      avg_speed_mph_managed_lane - avg_speed_mph_gp,
+    managed_time_savings_min_per_mile =
+      avg_travel_time_min_per_mile_gp -
+      avg_travel_time_min_per_mile_managed_lane,
+    managed_to_gp_hourly_volume_ratio =
+      avg_hourly_volume_per_station_managed_lane /
+      avg_hourly_volume_per_station_gp
+  ) %>%
+  arrange(direction, tod)
+
+print_table("Selected station managed lane vs GP time-of-day comparison:", selected_tod_compare)
+
+
+# Closest-station pair comparison ----
+
+## This table compares each managed-lane station directly with its nearest GP station.
+
+ml_tod_performance <- selected_station_tod_summary %>%
+  filter(facility == "Managed Lane") %>%
+  select(
+    direction,
+    tod,
+    ml_station_id = station_id,
+    ml_speed_mph = avg_speed_mph,
+    ml_travel_time_min_per_mile = avg_travel_time_min_per_mile,
+    ml_avg_hourly_volume_vph = avg_hourly_volume_vph,
+    ml_avg_daily_period_volume = avg_daily_period_volume,
+    ml_station_hours = station_hours,
+    ml_days_observed = days_observed
+  )
+
+
+gp_tod_performance <- selected_station_tod_summary %>%
+  filter(facility == "GP") %>%
+  select(
+    direction,
+    tod,
+    gp_station_id = station_id,
+    gp_speed_mph = avg_speed_mph,
+    gp_travel_time_min_per_mile = avg_travel_time_min_per_mile,
+    gp_avg_hourly_volume_vph = avg_hourly_volume_vph,
+    gp_avg_daily_period_volume = avg_daily_period_volume,
+    gp_station_hours = station_hours,
+    gp_days_observed = days_observed
+  )
+
+
+closest_station_pair_tod_compare <- closest_gp_to_ml %>%
+  select(
+    direction,
+    direction_label,
+    ml_station_id,
+    ml_post_mile,
+    ml_station_name,
+    gp_station_id,
+    gp_post_mile,
+    gp_station_name,
+    station_distance_mi
+  ) %>%
+  left_join(
+    ml_tod_performance,
+    by = c("direction", "ml_station_id")
+  ) %>%
+  left_join(
+    gp_tod_performance,
+    by = c("direction", "gp_station_id", "tod")
+  ) %>%
+  mutate(
+    managed_minus_gp_speed_mph =
+      ml_speed_mph - gp_speed_mph,
+    managed_time_savings_min_per_mile =
+      gp_travel_time_min_per_mile -
+      ml_travel_time_min_per_mile,
+    managed_to_gp_hourly_volume_ratio =
+      ml_avg_hourly_volume_vph /
+      gp_avg_hourly_volume_vph
+  ) %>%
+  arrange(direction, ml_post_mile, tod)
+
+print_table("Closest station pair time-of-day comparison:", closest_station_pair_tod_compare, n = 150)
+
+
+# Reporting tables ----
+
+## Clean ADT table.
+
+selected_adt_doc <- selected_adt_summary %>%
+  transmute(
+    Direction = case_when(
+      direction == "N" ~ "NB",
+      direction == "S" ~ "SB",
+      TRUE ~ direction
+    ),
+    Facility = case_when(
+      facility == "Managed Lane" ~ "ML",
+      TRUE ~ as.character(facility)
+    ),
+    `Avg. ADT per Station` = round(avg_adt_per_station, 0),
+    `Avg. Daily Speed (mph)` = round(avg_daily_speed_mph, 1),
+    `Stations Used` = stations_used,
+    `Days Observed` = days_observed
+  ) %>%
+  arrange(Direction, Facility)
+
+print_table("Selected station ADT and speed documentation table:", selected_adt_doc)
+
+
+## Clean time-of-day comparison table.
+## Travel-time savings are converted to seconds per mile for easier interpretation.
+
+selected_tod_compare_doc <- selected_tod_compare %>%
+  transmute(
+    Direction = case_when(
+      direction == "N" ~ "NB",
+      direction == "S" ~ "SB",
+      TRUE ~ direction
+    ),
+    Period = as.character(tod),
+    
+    `GP Speed (mph)` = round(avg_speed_mph_gp, 1),
+    `ML Speed (mph)` = round(avg_speed_mph_managed_lane, 1),
+    `ML - GP Speed (mph)` = round(managed_minus_gp_speed_mph, 1),
+    
+    `GP Travel Time (min/mi)` = round(avg_travel_time_min_per_mile_gp, 3),
+    `ML Travel Time (min/mi)` = round(avg_travel_time_min_per_mile_managed_lane, 3),
+    `ML Savings (sec/mi)` = round(managed_time_savings_min_per_mile * 60, 1),
+    
+    `GP Avg. Hourly Volume` = round(avg_hourly_volume_per_station_gp, 0),
+    `ML Avg. Hourly Volume` = round(avg_hourly_volume_per_station_managed_lane, 0),
+    `ML / GP Volume Ratio` = round(managed_to_gp_hourly_volume_ratio, 2),
+    
+    `GP Stations` = stations_used_gp,
+    `ML Stations` = stations_used_managed_lane
+  ) %>%
+  arrange(Direction, Period)
+
+print_table("Selected station time-of-day comparison documentation table:", selected_tod_compare_doc)
+
+
+# Congestion location summary ----
+
+# Lowest-speed paired location comparison ----
+
+## For each direction and time period, identify the paired ML/GP location
+## where either facility has the lowest speed.
+## Then compare ML and GP performance at that paired location.
+
+lowest_speed_pair_compare <- closest_station_pair_tod_compare %>%
+  mutate(
+    direction_short = case_when(
+      direction == "N" ~ "NB",
+      direction == "S" ~ "SB",
+      TRUE ~ direction
+    ),
+    comparison_post_mile = round((ml_post_mile + gp_post_mile) / 2, 3),
+    lowest_pair_speed_mph = pmin(ml_speed_mph, gp_speed_mph, na.rm = TRUE),
+    slowest_facility = case_when(
+      ml_speed_mph < gp_speed_mph ~ "ML",
+      gp_speed_mph < ml_speed_mph ~ "GP",
+      TRUE ~ "Tie"
+    ),
+    comparison_location = case_when(
+      slowest_facility == "ML" ~ ml_station_name,
+      slowest_facility == "GP" ~ gp_station_name,
+      TRUE ~ ml_station_name
+    )
+  ) %>%
+  group_by(direction, direction_label, tod) %>%
+  slice_min(lowest_pair_speed_mph, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(direction, tod)
+
+
+# Top 10 slowest paired ML/GP locations ----
+
+## One row per paired physical location.
+## The table is ranked by the lowest speed observed in either GP or ML.
+## If the same location appears more than once, keep the slowest case only.
+
+paired_location_candidates <- closest_station_pair_tod_compare %>%
+  filter(
+    !is.na(gp_speed_mph),
+    !is.na(ml_speed_mph)
+  ) %>%
+  mutate(
+    direction_short = case_when(
+      direction == "N" ~ "NB",
+      direction == "S" ~ "SB",
+      TRUE ~ direction
+    ),
+    comparison_post_mile = round((ml_post_mile + gp_post_mile) / 2, 3),
+    comparison_post_mile_key = sprintf("%.3f", comparison_post_mile),
+    lowest_pair_speed_mph = pmin(gp_speed_mph, ml_speed_mph),
+    slowest_facility = case_when(
+      ml_speed_mph < gp_speed_mph ~ "ML",
+      gp_speed_mph < ml_speed_mph ~ "GP",
+      TRUE ~ "Tie"
+    ),
+    location_name = case_when(
+      slowest_facility == "ML" ~ ml_station_name,
+      slowest_facility == "GP" ~ gp_station_name,
+      TRUE ~ ml_station_name
+    )
+  )
+
+
+top10_slowest_paired_locations <- paired_location_candidates %>%
+  arrange(
+    lowest_pair_speed_mph,
+    desc(abs(managed_minus_gp_speed_mph))
+  ) %>%
+  distinct(
+    direction_short,
+    comparison_post_mile_key,
+    .keep_all = TRUE
+  ) %>%
+  slice_head(n = 10) %>%
+  transmute(
+    Direction = direction_short,
+    Period = as.character(tod),
+    Location = location_name,
+    `Post Mile` = comparison_post_mile,
+    `Slowest Facility` = slowest_facility,
+    `GP Speed (mph)` = round(gp_speed_mph, 1),
+    `ML Speed (mph)` = round(ml_speed_mph, 1),
+    `ML - GP Speed (mph)` = round(managed_minus_gp_speed_mph, 1)
+  )
+
+print_table("Top 10 slowest paired ML/GP locations:", top10_slowest_paired_locations, n = 20)
+
+
+# Map I-15 and selected PeMS stations ----
+
+library(tidyverse)
+library(sf)
+library(ggplot2)
+
+
+# Caltrans State Highway Network Lines ----
+
+## Caltrans SHN Lines FeatureServer.
+## Query I-15 in District 11 and request GeoJSON in WGS84.
+
+shn_query_url <- paste0(
+  "https://caltrans-gis.dot.ca.gov/arcgis/rest/services/CHhighway/SHN_Lines/FeatureServer/0/query?",
+  "where=", URLencode("Route = 15 AND District = 11", reserved = TRUE),
+  "&outFields=Route,RouteS,County,District,bPM,ePM,Direction,AlignCode",
+  "&returnGeometry=true",
+  "&outSR=4326",
+  "&f=geojson"
+)
+
+i15_shn <- st_read(shn_query_url, quiet = TRUE) %>%
+  st_make_valid()
+
+
+# Station points ----
+
+## Use selected_station_table if we want the stations used in the analysis.
+## Use healthy_station_location_table if we want all healthy stations.
+
+stations_to_map <- selected_station_table %>%
+  mutate(
+    direction_short = case_when(
+      direction == "N" ~ "NB",
+      direction == "S" ~ "SB",
+      TRUE ~ direction
+    ),
+    facility_short = case_when(
+      facility == "Managed Lane" ~ "ML",
+      facility == "GP" ~ "GP",
+      TRUE ~ as.character(facility)
+    ),
+    map_label = paste0(direction_short, " ", facility_short, " PM ", round(post_mile, 1))
+  ) %>%
+  filter(
+    !is.na(latitude),
+    !is.na(longitude)
+  ) %>%
+  st_as_sf(
+    coords = c("longitude", "latitude"),
+    crs = 4326,
+    remove = FALSE
+  )
+
+
+# Map extent ----
+
+map_bbox <- st_bbox(stations_to_map)
+
+
+# Map: selected GP and ML stations with stronger label repel ----
+
+library(ggrepel)
+
+## Label dataframe for ggrepel.
+## Use one combined label layer so GP and ML labels repel from each other.
+
+stations_label_df <- stations_to_map %>%
+  st_drop_geometry() %>%
+  mutate(
+    map_label = station_name
+  )
+
+## More map padding so labels have room to move.
+
+x_pad <- 0.14
+y_pad <- 0.06
+
+
+p_i15_selected_stations <- ggplot() +
+  geom_sf(
+    data = i15_shn,
+    linewidth = 0.8
+  ) +
+  geom_sf(
+    data = stations_to_map,
+    aes(shape = facility_short),
+    size = 2.8
+  ) +
+  
+  ## One combined repel layer.
+  geom_label_repel(
+    data = stations_label_df,
+    aes(
+      x = longitude,
+      y = latitude,
+      label = map_label
+    ),
+    size = 2.2,
+    label.size = 0.15,
+    label.padding = unit(0.12, "lines"),
+    box.padding = 0.9,
+    point.padding = 0.7,
+    min.segment.length = 0,
+    segment.size = 0.25,
+    force = 25,
+    force_pull = 0.03,
+    max.iter = 20000,
+    max.time = 5,
+    max.overlaps = Inf,
+    direction = "both",
+    seed = 123
+  ) +
+  
+  coord_sf(
+    xlim = c(map_bbox["xmin"] - x_pad, map_bbox["xmax"] + x_pad),
+    ylim = c(map_bbox["ymin"] - y_pad, map_bbox["ymax"] + y_pad),
+    expand = FALSE,
+    clip = "off"
+  ) +
+  facet_wrap(~ direction_short) +
+  labs(
+    title = "I-15 Selected PeMS Station Locations",
+    subtitle = "Selected healthy managed-lane stations and nearest healthy GP stations",
+    x = NULL,
+    y = NULL,
+    shape = "Facility"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "bottom",
+    panel.grid = element_blank(),
+    plot.margin = margin(10, 40, 10, 40)
+  )
+
+print(p_i15_selected_stations)
+
+# Station-pair speed and ADT CSV ----
+
+## Creates one row per ML/GP station pair by time of day.
+## Location is always the ML station name.
+## ADT is average daily volume during that time-of-day period.
+## Volumes are not lane-normalized.
+
+if (!exists("i15_selected")) {
+  stop("Object `i15_selected` does not exist. Run the selected station analysis first.")
+}
+
+if (!exists("closest_gp_to_ml")) {
+  stop("Object `closest_gp_to_ml` does not exist. Run the station-pair selection first.")
+}
+
+analysis_output_dir <- file.path("4_Outputs")
+dir.create(analysis_output_dir, showWarnings = FALSE, recursive = TRUE)
+
+
+# Build clean station-pair lookup ----
+
+## Each ML station gets one nearest GP station.
+## The location field is the ML station name.
+
+station_pair_lookup <- closest_gp_to_ml %>%
+  transmute(
+    direction,
+    direction_label,
+    ml_station_id,
+    gp_station_id,
+    location = ml_station_name,
+    post_mile = ml_post_mile,
+    ml_station_name,
+    gp_station_name,
+    ml_post_mile,
+    gp_post_mile,
+    station_distance_mi
+  ) %>%
+  distinct(
+    direction,
+    ml_station_id,
+    gp_station_id,
+    .keep_all = TRUE
+  ) %>%
+  arrange(direction, post_mile)
+
+
+print_table("Station pair lookup:", station_pair_lookup, n = 100)
+
+
+# Station-day-period performance ----
+
+## First calculate daily period volume and speed for each station.
+
+station_day_tod <- i15_selected %>%
+  group_by(
+    date,
+    direction,
+    direction_label,
+    facility,
+    station_id,
+    tod
+  ) %>%
+  summarise(
+    daily_period_volume = sum(total_flow_vph, na.rm = TRUE),
+    daily_period_speed = weighted_speed(avg_speed_mph, total_flow_vph),
+    .groups = "drop"
+  )
+
+
+# Station-level time-of-day summary ----
+
+## Average across days for each station and time period.
+
+station_tod_summary <- station_day_tod %>%
+  group_by(
+    direction,
+    direction_label,
+    facility,
+    station_id,
+    tod
+  ) %>%
+  summarise(
+    speed_mph = weighted_speed(daily_period_speed, daily_period_volume),
+    adt = mean(daily_period_volume, na.rm = TRUE),
+    days_observed = n_distinct(date),
+    .groups = "drop"
+  )
+
+
+# Split GP and ML station summaries ----
+
+ml_tod_summary <- station_tod_summary %>%
+  filter(facility == "Managed Lane") %>%
+  transmute(
+    direction,
+    tod,
+    ml_station_id = station_id,
+    ml_speed_mph = speed_mph,
+    ml_adt = adt,
+    ml_days_observed = days_observed
+  )
+
+
+gp_tod_summary <- station_tod_summary %>%
+  filter(facility == "GP") %>%
+  transmute(
+    direction,
+    tod,
+    gp_station_id = station_id,
+    gp_speed_mph = speed_mph,
+    gp_adt = adt,
+    gp_days_observed = days_observed
+  )
+
+
+# Join GP and ML performance to each station pair ----
+
+station_pair_tod_speed_adt <- station_pair_lookup %>%
+  left_join(
+    ml_tod_summary,
+    by = c("direction", "ml_station_id")
+  ) %>%
+  left_join(
+    gp_tod_summary,
+    by = c("direction", "gp_station_id", "tod")
+  ) %>%
+  mutate(
+    direction_short = case_when(
+      direction == "N" ~ "NB",
+      direction == "S" ~ "SB",
+      TRUE ~ direction
+    ),
+    time_of_day = as.character(tod),
+    ml_minus_gp_speed_mph = ml_speed_mph - gp_speed_mph,
+    ml_to_gp_adt_ratio = ml_adt / gp_adt
+  ) %>%
+  distinct(
+    direction_short,
+    ml_station_id,
+    gp_station_id,
+    time_of_day,
+    .keep_all = TRUE
+  ) %>%
+  transmute(
+    direction = direction_short,
+    location,
+    post_mile = round(post_mile, 3),
+    time_of_day,
+    
+    gp_speed_mph = round(gp_speed_mph, 1),
+    ml_speed_mph = round(ml_speed_mph, 1),
+    ml_minus_gp_speed_mph = round(ml_minus_gp_speed_mph, 1),
+    
+    gp_adt = round(gp_adt, 0),
+    ml_adt = round(ml_adt, 0),
+    ml_to_gp_adt_ratio = round(ml_to_gp_adt_ratio, 2),
+    
+    gp_station_id,
+    ml_station_id,
+    station_distance_mi = round(station_distance_mi, 3),
+    gp_days_observed,
+    ml_days_observed
+  ) %>%
+  mutate(
+    time_of_day = factor(
+      time_of_day,
+      levels = c("AM Peak", "PM Peak", "Off-Peak")
+    )
+  ) %>%
+  arrange(
+    direction,
+    post_mile,
+    time_of_day
+  )
+
+
+# Duplicate QA ----
+
+## There should be only one row per direction / ML station / GP station / time period.
+
+station_pair_duplicate_check <- station_pair_tod_speed_adt %>%
+  count(
+    direction,
+    ml_station_id,
+    gp_station_id,
+    time_of_day,
+    name = "rows"
+  ) %>%
+  filter(rows > 1)
+
+print_table("Station pair duplicate check:", station_pair_duplicate_check)
+
+if (nrow(station_pair_duplicate_check) > 0) {
+  warning("Duplicate station-pair/time-of-day rows found.")
+}
+
+
+# Simple output table ----
+
+## This is the clean CSV requested.
+
+station_pair_tod_speed_adt_simple <- station_pair_tod_speed_adt %>%
+  select(
+    direction,
+    location,
+    post_mile,
+    time_of_day,
+    gp_speed_mph,
+    ml_speed_mph,
+    ml_minus_gp_speed_mph,
+    gp_adt,
+    ml_adt
+  )
+
+
+print_table(
+  "Station-pair speed and ADT CSV preview:",
+  station_pair_tod_speed_adt_simple,
+  n = 100
+)
+
+
+# Write CSV ----
+
+station_pair_tod_csv_path <- file.path(
+  analysis_output_dir,
+  "i15_station_pair_tod_speed_adt.csv"
+)
+
+write_csv(
+  station_pair_tod_speed_adt_simple,
+  station_pair_tod_csv_path
+)
+
+cat("\nStation-pair speed and ADT CSV written to:\n")
+cat(station_pair_tod_csv_path, "\n")
+
+
+# Station-pair speed and ADT by fiscal year ----
+
+## Creates:
+##   FY23 = July 1, 2022 through June 30, 2023
+##   FY24 = July 1, 2023 through June 30, 2024
+##   FY25 = July 1, 2024 through June 30, 2025
+##
+## FY25 currently has no June 2025 data.
+##
+## The primary workbook table has one row per station pair and time period,
+## with separate GP and ML columns for each fiscal year.
+
+
+# Required objects ----
+
+if (!exists("i15_selected")) {
+  stop("Object `i15_selected` does not exist. Run the selected-station analysis first.")
+}
+
+if (!exists("closest_gp_to_ml")) {
+  stop("Object `closest_gp_to_ml` does not exist. Run the station-pair selection first.")
+}
+
+if (!exists("i15_analysis_base")) {
+  stop("Object `i15_analysis_base` does not exist. Run the analysis-base section first.")
+}
+
+
+# Output folder ----
+
+analysis_output_dir <- file.path(
+  "4_Outputs")
+
+dir.create(
+  analysis_output_dir,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+
+# Long-format fiscal-year comparison ----
+
+## One row per station pair, time period, and fiscal year.
+
+station_pair_tod_fy_long <- station_pair_lookup %>%
+  crossing(
+    fiscal_year = factor(
+      c("FY24", "FY25", "FY26"),
+      levels = c("FY24", "FY25", "FY26")
+    ),
+    tod = factor(
+      c("AM Peak", "PM Peak", "Off-Peak"),
+      levels = c("AM Peak", "PM Peak", "Off-Peak")
+    )
+  ) %>%
+  left_join(
+    ml_tod_summary_fy,
+    by = c(
+      "fiscal_year",
+      "direction",
+      "tod",
+      "ml_station_id"
+    )
+  ) %>%
+  left_join(
+    gp_tod_summary_fy,
+    by = c(
+      "fiscal_year",
+      "direction",
+      "tod",
+      "gp_station_id"
+    )
+  ) %>%
+  mutate(
+    direction_short = case_when(
+      direction == "N" ~ "NB",
+      direction == "S" ~ "SB",
+      TRUE ~ direction
+    ),
+    time_of_day = as.character(tod),
+    ml_minus_gp_speed_mph =
+      ml_speed_mph - gp_speed_mph,
+    ml_to_gp_adt_ratio =
+      ml_adt / gp_adt
+  ) %>%
+  transmute(
+    direction = direction_short,
+    location,
+    post_mile = round(post_mile, 3),
+    time_of_day,
+    fiscal_year = as.character(fiscal_year),
+    
+    gp_speed_mph = round(gp_speed_mph, 1),
+    ml_speed_mph = round(ml_speed_mph, 1),
+    ml_minus_gp_speed_mph =
+      round(ml_minus_gp_speed_mph, 1),
+    
+    gp_adt = round(gp_adt, 0),
+    ml_adt = round(ml_adt, 0),
+    ml_to_gp_adt_ratio =
+      round(ml_to_gp_adt_ratio, 2),
+    
+    gp_days_observed,
+    ml_days_observed,
+    gp_station_id,
+    ml_station_id,
+    station_distance_mi =
+      round(station_distance_mi, 3)
+  ) %>%
+  mutate(
+    fiscal_year = factor(
+      fiscal_year,
+      levels = c("FY24", "FY25", "FY26")
+    ),
+    time_of_day = factor(
+      time_of_day,
+      levels = c(
+        "AM Peak",
+        "PM Peak",
+        "Off-Peak"
+      )
+    )
+  ) %>%
+  arrange(
+    direction,
+    post_mile,
+    time_of_day,
+    fiscal_year
+  )
+
+
+# Duplicate QA ----
+
+station_pair_duplicate_check <- station_pair_tod_fy_long %>%
+  count(
+    direction,
+    ml_station_id,
+    gp_station_id,
+    time_of_day,
+    fiscal_year,
+    name = "rows"
+  ) %>%
+  filter(rows > 1)
+
+print_table(
+  "Fiscal-year station-pair duplicate check:",
+  station_pair_duplicate_check
+)
+
+if (nrow(station_pair_duplicate_check) > 0) {
+  warning(
+    "Duplicate station-pair, time-of-day, and fiscal-year rows found."
+  )
+}
+
+
+# Wide fiscal-year comparison table ----
+
+## GP and ML speeds receive separate columns for each fiscal year,
+## using suffixes such as:
+##
+##   gp_speed_mph_FY24
+##   ml_speed_mph_FY24
+##   gp_speed_mph_FY25
+##   ml_speed_mph_FY25
+##   gp_speed_mph_FY26
+##   ml_speed_mph_FY26
+##
+## ADT and the ML-GP speed difference are also separated by fiscal year
+## so all measures use the same underlying time period.
+
+station_pair_tod_fy_wide <- station_pair_tod_fy_long %>%
+  select(
+    direction,
+    location,
+    post_mile,
+    time_of_day,
+    fiscal_year,
+    gp_speed_mph,
+    ml_speed_mph,
+    ml_minus_gp_speed_mph,
+    gp_adt,
+    ml_adt,
+    ml_to_gp_adt_ratio
+  ) %>%
+  pivot_wider(
+    names_from = fiscal_year,
+    values_from = c(
+      gp_speed_mph,
+      ml_speed_mph,
+      ml_minus_gp_speed_mph,
+      gp_adt,
+      ml_adt,
+      ml_to_gp_adt_ratio
+    ),
+    names_glue = "{.value}_{fiscal_year}",
+    names_expand = TRUE
+  ) %>%
+  select(
+    direction,
+    location,
+    post_mile,
+    time_of_day,
+    
+    gp_speed_mph_FY24,
+    ml_speed_mph_FY24,
+    ml_minus_gp_speed_mph_FY24,
+    gp_adt_FY24,
+    ml_adt_FY24,
+    ml_to_gp_adt_ratio_FY24,
+    
+    gp_speed_mph_FY25,
+    ml_speed_mph_FY25,
+    ml_minus_gp_speed_mph_FY25,
+    gp_adt_FY25,
+    ml_adt_FY25,
+    ml_to_gp_adt_ratio_FY25,
+    
+    gp_speed_mph_FY26,
+    ml_speed_mph_FY26,
+    ml_minus_gp_speed_mph_FY26,
+    gp_adt_FY26,
+    ml_adt_FY26,
+    ml_to_gp_adt_ratio_FY26
+  ) %>%
+  arrange(
+    direction,
+    post_mile,
+    time_of_day
+  )
+
+print_table(
+  "Station-pair fiscal-year comparison:",
+  station_pair_tod_fy_wide,
+  n = 100
+)
+
+
+# Workbook notes ----
+
+fy26_coverage_description <- fiscal_year_coverage %>%
+  filter(as.character(fiscal_year) == "FY26") %>%
+  transmute(
+    description = paste0(
+      coverage_status,
+      ": ",
+      coverage_note
+    )
+  ) %>%
+  pull(description) %>%
+  first(
+    default = "No FY26 coverage information available."
+  )
+
+
+workbook_notes <- tibble(
+  item = c(
+    "Workbook purpose",
+    "FY24",
+    "FY25",
+    "FY26",
+    "FY26 coverage",
+    "Day filter",
+    "Speed calculation",
+    "ADT calculation",
+    "Station pairing"
+  ),
+  
+  description = c(
+    paste(
+      "Compares weekday GP and managed-lane performance",
+      "by station pair, time of day, and fiscal year."
+    ),
+    
+    "July 1, 2023 through June 30, 2024.",
+    
+    "July 1, 2024 through June 30, 2025.",
+    
+    "July 1, 2025 through June 30, 2026.",
+    
+    fy26_coverage_description,
+    
+    ifelse(
+      weekdays_only,
+      "Weekdays only.",
+      "All days."
+    ),
+    
+    paste(
+      "Speeds are weighted by station flow.",
+      "Only complete station-hour records are included."
+    ),
+    
+    paste(
+      "ADT represents average daily volume during the specified",
+      "time-of-day period; it is not lane-normalized."
+    ),
+    
+    paste(
+      "Each healthy managed-lane station is paired with",
+      "the nearest healthy GP station in the same direction."
+    )
+  )
+)
+
+
+# Write Excel workbook ----
+
+workbook_path <- file.path(
+  analysis_output_dir,
+  paste0(
+    "i15_station_pair_tod_speed_adt_",
+    "by_fiscal_year_FY24_FY26.xlsx"
+  )
+)
+
+write_xlsx(
+  list(
+    "FY Comparison" =
+      station_pair_tod_fy_wide,
+    
+    "Long Format" =
+      station_pair_tod_fy_long,
+    
+    "FY Coverage" =
+      fiscal_year_coverage,
+    
+    "Station Pairs" =
+      station_pair_lookup,
+    
+    "Notes" =
+      workbook_notes
+  ),
+  path = workbook_path
+)
+
+cat("\nFiscal-year workbook written to:\n")
+cat(workbook_path, "\n")
