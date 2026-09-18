@@ -1,1473 +1,1854 @@
-# Setup ----
 
-## Working directory ----
+# Section 1 - Setup ----
 
-setwd("C:/Users/Jeffrey Castanon/San Diego Association of Governments/Data Science - Documents/Economics/FY2025_26 Projects/Misc Projects/0626_PeMS Station Data")
-setwd("C:/Users/jcast/San Diego Association of Governments/Data Science - Documents/Economics/FY2025_26 Projects/Misc Projects/0626_PeMS Station Data")
+rm(list = ls())
+gc()
 
+## Paths and packages ----
 
-## Libraries ----
+setwd("C:/Users/jcast/San Diego Association of Governments/Data Science - Documents/Economics/FY2026_27 Projects/Misc Projects/0826_15 Expressway PeMS Analysis")
 
 library(tidyverse)
-library(janitor)
 library(lubridate)
-library(writexl)
+library(openxlsx)
 
-options(na.print = "NA")
-
-
-# Output folder ----
-
-output_dir <- "2_Data Cleaning"
-analysis_output_dir <- file.path(output_dir, "analysis_outputs")
-
-dir.create(analysis_output_dir, showWarnings = FALSE, recursive = TRUE)
+clean_dir <- "2_Data Cleaning"
+output_dir <- "4_Outputs"
 
 
-# Read master dataframe ----
-
-master_rds_path <- file.path(output_dir, "i15_master_clean.rds")
-
-i15_master_clean <- readRDS(master_rds_path) %>%
-  mutate(
-    facility = factor(facility, levels = c("GP", "Managed Lane")),
-    tod = factor(tod, levels = c("AM Peak", "PM Peak", "Off-Peak"))
-  )
-
-cat("\nMaster dataframe read successfully:\n")
-
-i15_master_clean %>%
-  summarise(
-    rows = n(),
-    first_timestamp = min(ts, na.rm = TRUE),
-    last_timestamp = max(ts, na.rm = TRUE),
-    stations = n_distinct(station_id),
-    months = n_distinct(month)
-  ) %>%
-  print()
-
-
-# Analysis controls ----
-
-## These can be adjusted later without rebuilding the master dataframe.
-
-weekdays_only <- TRUE
+## Analysis controls ----
 
 min_hour_pct_observed <- 75
 health_threshold <- 0.75
 
+time_periods <- c("AM Peak", "Midday", "PM Peak")
+month_order <- c("July", "October", "December", "March")
+weekday_order <- c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 
-# Helper functions ----
+day_group_order <- c(
+  "Monday / Friday",
+  "Tuesday - Thursday",
+  "Saturday / Sunday"
+)
 
-weighted_speed <- function(speed, flow) {
+fy_order <- c("FY24", "FY25", "FY26")
+report_direction_order <- c("Northbound", "Southbound")
+
+
+# Section 2 - Station pair health ----
+#
+# First step was figuring out where we actually have enough data to report.
+#
+# Fixed EL / GP station pairs below. We track the same pairs across FY24-FY26.
+# Weekly station health is based on completeness of valid hourly observations.
+# Pair health requires BOTH the EL and GP station to pass.
+
+
+## Fixed EL / GP station pairs ----
+
+fixed_station_pairs <- tribble(
+  ~direction, ~direction_label, ~el_station_id, ~el_station_name, ~gp_station_id, ~gp_station_name,
   
-  good <- !is.na(speed) & !is.na(flow) & flow > 0
+  "N", "Northbound", "1115829", "15 NB HOV N/O Carroll Canyon Rd",  "1115739", "15 NB N/O Carroll Cyn Rd",
+  "N", "Northbound", "1121044", "15 NB HOV S/O Bernardo Center Dr", "1120994", "15 NB S/O Bernardo Center Dr",
+  "N", "Northbound", "1121052", "15 NB HOV N/O Bernardo Center Dr", "1121037", "15 NB N/O Bernardo Center Dr",
+  "N", "Northbound", "1121135", "15 NB HOV Green Valley Creek",      "1121099", "15 NB Green Valley Creek",
+  "N", "Northbound", "1122502", "15 NB HOV N/O Auto Park Way/9th",  "1108771", "Auto Park Way/9th Ave to 15 NB",
+  "N", "Northbound", "1123148", "15 NB HOV S/O Rte 78",             "1108773", "Valley Parkway to 15 NB",
+  "N", "Northbound", "1125324", "15 NB HOV Valley Parkway",         "1119689", "15 NB S/O Ocean View Blvd",
+  "N", "Northbound", "1125486", "15 NB HOV Felicita/Citracado Pkw", "1108769", "Felicita/Citracado Pkwy to 15 NB",
   
-  if (!any(good)) {
-    return(NA_real_)
-  }
-  
-  weighted.mean(speed[good], w = flow[good])
-}
+  "S", "Southbound", "1125503", "15 SB HOV Center City Pkwy",       "1119683", "15 SB N/O National Ave",
+  "S", "Southbound", "1126631", "15 SB S/O HOV lanes",              "1115802", "15 SB S/O HOV lanes",
+  "S", "Southbound", "1126837", "15 SB HOV N/O Felicita/Citracado", "1125879", "15 SB N/O Felicita/Citracado",
+  "S", "Southbound", "1122925", "15 SB HOV S/O Camino del Norte",   "1123006", "15 SB S/O Camino del Norte",
+  "S", "Southbound", "1121165", "15 SB HOV N/O Rancho Bernardo Rd", "1121034", "15 SB N/O Rancho Bernardo Rd",
+  "S", "Southbound", "1121158", "15 SB HOV S/O Pomerado/W Bernard", "1121125", "15 SB S/O Pomerado/W Bernardo",
+  "S", "Southbound", "1121142", "15 SB HOV S/O Via Rancho Parkway", "1121112", "15 SB S/O Via Rancho Parkway"
+)
 
 
-print_table <- function(title, data, n = 50) {
-  
-  cat("\n", title, "\n", sep = "")
-  base::print(as.data.frame(head(data, n)), row.names = FALSE)
-}
+## Read PeMS master data ----
+#
+# Clean hourly master file. Cleaning upstream of this file is unchanged and
+# was reviewed separately.
 
-
-safe_min <- function(x) {
-  if (all(is.na(x))) {
-    return(NA_real_)
-  }
-  min(x, na.rm = TRUE)
-}
-
-
-safe_median <- function(x) {
-  if (all(is.na(x))) {
-    return(NA_real_)
-  }
-  median(x, na.rm = TRUE)
-}
-
-
-safe_mean <- function(x) {
-  if (all(is.na(x))) {
-    return(NA_real_)
-  }
-  mean(x, na.rm = TRUE)
-}
-
-
-safe_first_character <- function(x) {
-  
-  x <- x[!is.na(x) & x != ""]
-  
-  if (length(x) == 0) {
-    return(NA_character_)
-  }
-  
-  x[1]
-}
-
-
-# Analysis base ----
-
-## Apply weekday filter and refresh record-quality fields using current assumptions.
-
-i15_analysis_base <- i15_master_clean %>%
-  filter(
-    if (weekdays_only) is_weekday else TRUE
-  ) %>%
+i15_master <- readRDS(file.path(clean_dir, "i15_master_clean.rds")) %>%
   mutate(
-    valid_speed = !is.na(avg_speed_mph) & avg_speed_mph > 0,
-    valid_volume = !is.na(total_flow_vph) & total_flow_vph >= 0,
-    reported_record =
+    station_id = as.character(station_id),
+    direction = as.character(direction),
+    
+    facility = case_when(
+      as.character(facility) %in% c("Managed Lane", "Express Lane") ~ "Express Lane",
+      as.character(facility) == "GP" ~ "GP",
+      TRUE ~ as.character(facility)
+    ),
+    
+    date = as_date(ts),
+    
+    # Valid hourly observation
+    complete_record =
       !is.na(pct_observed) &
       pct_observed >= min_hour_pct_observed &
       !is.na(samples) &
-      samples > 0,
-    complete_record =
-      reported_record &
-      valid_speed &
-      valid_volume
+      samples > 0 &
+      !is.na(avg_speed_mph) &
+      avg_speed_mph > 0 &
+      !is.na(total_flow_vph) &
+      total_flow_vph >= 0
   )
 
 
-analysis_base_summary <- i15_analysis_base %>%
-  summarise(
-    rows = n(),
-    first_date = min(date, na.rm = TRUE),
-    last_date = max(date, na.rm = TRUE),
-    stations = n_distinct(station_id),
-    months = n_distinct(month),
-    complete_record_share = mean(complete_record, na.rm = TRUE)
-  )
+## Build FY24-FY26 analysis weeks ----
+#
+# Full Monday-Sunday weeks.
 
-print_table("Analysis base summary:", analysis_base_summary)
-
-
-# Station health ----
-
-## Healthy stations have complete records for at least the selected share
-## of expected weekday station-hours.
-
-station_health_parameters <- tibble(
-  parameter = c(
-    "Minimum observed share for usable station-hour",
-    "Minimum complete-record share for healthy station"
-  ),
-  value = c(
-    paste0(min_hour_pct_observed, "%"),
-    paste0(health_threshold * 100, "%")
-  )
-)
-
-print_table("Station health parameters:", station_health_parameters)
-
-
-analysis_hours <- i15_analysis_base %>%
-  distinct(ts, month) %>%
-  arrange(ts)
-
-analysis_hour_vec <- sort(unique(analysis_hours$ts))
-
-
-count_expected_hours_from_data <- function(start_ts, end_ts, hour_vec) {
-  
-  if (is.na(start_ts) || is.na(end_ts) || end_ts < start_ts) {
-    return(NA_integer_)
-  }
-  
-  sum(hour_vec >= start_ts & hour_vec <= end_ts)
-}
-
-
-station_health_detail <- i15_analysis_base %>%
-  group_by(direction, direction_label, facility, station_id) %>%
-  summarise(
-    first_ts = min(ts, na.rm = TRUE),
-    last_ts = max(ts, na.rm = TRUE),
-    
-    records_present = n_distinct(ts),
-    reported_records = n_distinct(ts[reported_record]),
-    complete_records = n_distinct(ts[complete_record]),
-    
-    avg_pct_observed = safe_mean(pct_observed),
-    median_pct_observed = safe_median(pct_observed),
-    min_pct_observed = safe_min(pct_observed),
-    
-    station_length_mi = safe_median(station_length_mi),
-    corridor_mile = safe_median(corridor_mile),
-    latitude = safe_median(latitude),
-    longitude = safe_median(longitude),
-    station_name = safe_first_character(station_name),
-    
-    .groups = "drop"
-  ) %>%
-  rowwise() %>%
-  mutate(
-    expected_records = count_expected_hours_from_data(
-      start_ts = first_ts,
-      end_ts = last_ts,
-      hour_vec = analysis_hour_vec
-    )
-  ) %>%
-  ungroup() %>%
-  mutate(
-    share_records_present = records_present / expected_records,
-    share_reported = reported_records / expected_records,
-    share_complete = complete_records / expected_records,
-    healthy_station = share_complete >= health_threshold
-  ) %>%
-  arrange(direction, facility, corridor_mile, station_id)
-
-
-station_health_summary <- station_health_detail %>%
-  group_by(direction, direction_label, facility) %>%
-  summarise(
-    stations_total = n_distinct(station_id),
-    
-    healthy_stations = sum(
-      healthy_station,
-      na.rm = TRUE
-    ),
-    
-    unhealthy_stations =
-      stations_total - healthy_stations,
-    
-    share_healthy =
-      healthy_stations / stations_total,
-    
-    avg_share_complete = mean(
-      share_complete,
-      na.rm = TRUE
-    ),
-    
-    stations_share_complete_75 = sum(
-      share_complete >= health_threshold,
-      na.rm = TRUE
-    ),
-    
-    stations_pct_observed_75 = sum(
-      avg_pct_observed >= min_hour_pct_observed,
-      na.rm = TRUE
-    ),
-    
-    group_avg_pct_observed = mean(
-      avg_pct_observed,
-      na.rm = TRUE
-    ),
-    
-    .groups = "drop"
-  ) %>%
-  arrange(direction, facility)
-
-print_table("Station health summary:", station_health_summary)
-
-write.csv(station_health_summary, "4_Outputs/station_health_summary.csv")
-# Healthy station location table ----
-
-## This table documents where the usable data is coming from.
-## It is station-level and includes postmile and station name.
-
-healthy_station_location_table <- station_health_detail %>%
-  filter(healthy_station) %>%
-  transmute(
-    direction,
-    direction_label,
-    facility,
-    station_id,
-    post_mile = corridor_mile,
-    station_name,
-    share_complete,
-    avg_pct_observed,
-    latitude,
-    longitude
-  ) %>%
-  arrange(direction, facility, post_mile, station_id)
-
-print_table("Healthy station location table:", healthy_station_location_table, n = 150)
-
-
-# Select nearest GP stations to managed-lane stations ----
-
-## For each healthy managed-lane station, select the closest healthy GP station
-## in the same direction using corridor mile / postmile.
-
-ml_stations <- healthy_station_location_table %>%
-  filter(facility == "Managed Lane") %>%
-  select(
-    direction,
-    direction_label,
-    ml_station_id = station_id,
-    ml_post_mile = post_mile,
-    ml_station_name = station_name,
-    ml_share_complete = share_complete,
-    ml_avg_pct_observed = avg_pct_observed
-  )
-
-
-gp_stations <- healthy_station_location_table %>%
-  filter(facility == "GP") %>%
-  select(
-    direction,
-    direction_label,
-    gp_station_id = station_id,
-    gp_post_mile = post_mile,
-    gp_station_name = station_name,
-    gp_share_complete = share_complete,
-    gp_avg_pct_observed = avg_pct_observed
-  )
-
-
-closest_gp_to_ml <- ml_stations %>%
-  inner_join(
-    gp_stations,
-    by = c("direction", "direction_label")
-  ) %>%
-  mutate(
-    station_distance_mi = abs(ml_post_mile - gp_post_mile)
-  ) %>%
-  group_by(direction, direction_label, ml_station_id) %>%
-  slice_min(station_distance_mi, n = 1, with_ties = FALSE) %>%
-  ungroup() %>%
-  arrange(direction, ml_post_mile)
-
-print_table("Closest GP station to each managed-lane station:", closest_gp_to_ml, n = 100)
-
-
-## Build selected station table.
-## Managed-lane stations are retained.
-## GP stations are limited to the nearest healthy GP station for each managed-lane station.
-
-selected_station_keys <- bind_rows(
-  closest_gp_to_ml %>%
-    transmute(
-      direction,
-      facility = "Managed Lane",
-      station_id = ml_station_id
-    ),
-  closest_gp_to_ml %>%
-    transmute(
-      direction,
-      facility = "GP",
-      station_id = gp_station_id
-    )
+analysis_weeks <- tibble(
+  week_start = seq(from = ymd("2023-07-03"), to = ymd("2026-06-22"), by = "1 week")
 ) %>%
-  distinct() %>%
   mutate(
-    facility = factor(facility, levels = c("GP", "Managed Lane"))
+    week_end = week_start + days(6),
+    
+    fiscal_year = case_when(
+      week_start <= ymd("2024-06-30") ~ "FY24",
+      week_start <= ymd("2025-06-30") ~ "FY25",
+      TRUE ~ "FY26"
+    ),
+    
+    week_label = paste0(fiscal_year, " | ", format(week_start, "%Y-%m-%d"))
   )
 
 
-selected_station_table <- healthy_station_location_table %>%
-  semi_join(
-    selected_station_keys,
-    by = c("direction", "facility", "station_id")
+## Assign hourly records to analysis weeks ----
+
+analysis_data <- i15_master %>%
+  filter(
+    date >= min(analysis_weeks$week_start),
+    date <= max(analysis_weeks$week_end)
   ) %>%
-  arrange(direction, facility, post_mile, station_id)
-
-print_table("Selected stations for analysis:", selected_station_table, n = 100)
-
-
-# Selected station analysis base ----
-
-## The main comparison uses only managed-lane stations and their nearest GP station.
-
-i15_selected <- i15_analysis_base %>%
-  semi_join(
-    selected_station_keys,
-    by = c("direction", "facility", "station_id")
-  ) %>%
-  filter(complete_record)
+  mutate(week_start = floor_date(date, unit = "week", week_start = 1) %>% as_date()) %>%
+  inner_join(analysis_weeks, by = "week_start")
 
 
-selected_analysis_summary <- i15_selected %>%
-  group_by(direction, direction_label, facility) %>%
-  summarise(
-    rows = n(),
-    stations = n_distinct(station_id),
-    min_post_mile = min(corridor_mile, na.rm = TRUE),
-    max_post_mile = max(corridor_mile, na.rm = TRUE),
-    days_observed = n_distinct(date),
-    .groups = "drop"
-  ) %>%
-  arrange(direction, facility)
+## Expected hours per week ----
+#
+# Used as the denominator for weekly station completeness.
 
-print_table("Selected station analysis base summary:", selected_analysis_summary)
+week_expected_hours <- analysis_data %>%
+  group_by(fiscal_year, week_start, week_end, week_label) %>%
+  summarise(expected_hours = n_distinct(ts), .groups = "drop")
 
 
-# ADT and speed summary ----
+## Station IDs used in pair analysis ----
 
-## ADT is calculated as average daily station volume.
-## Speed is volume-weighted.
-
-selected_station_daily_summary <- i15_selected %>%
-  group_by(date, direction, direction_label, facility, station_id, corridor_mile, station_name) %>%
-  summarise(
-    station_daily_volume = sum(total_flow_vph, na.rm = TRUE),
-    station_daily_speed = weighted_speed(avg_speed_mph, total_flow_vph),
-    .groups = "drop"
-  )
+station_ids <- bind_rows(
+  fixed_station_pairs %>% transmute(direction, facility = "Express Lane", station_id = el_station_id),
+  fixed_station_pairs %>% transmute(direction, facility = "GP", station_id = gp_station_id)
+) %>%
+  distinct()
 
 
-selected_adt_summary <- selected_station_daily_summary %>%
-  group_by(direction, direction_label, facility) %>%
-  summarise(
-    avg_adt_per_station = mean(station_daily_volume, na.rm = TRUE),
-    avg_daily_speed_mph = weighted_speed(station_daily_speed, station_daily_volume),
-    stations_used = n_distinct(station_id),
-    days_observed = n_distinct(date),
-    .groups = "drop"
-  ) %>%
-  arrange(direction, facility)
+## Calculate weekly station health ----
 
-print_table("Selected station ADT and speed summary:", selected_adt_summary)
+station_week_health_observed <- analysis_data %>%
+  semi_join(station_ids, by = c("direction", "facility", "station_id")) %>%
+  group_by(fiscal_year, week_start, week_end, week_label, direction, facility, station_id) %>%
+  summarise(complete_hours = n_distinct(ts[complete_record]), .groups = "drop")
 
 
-selected_adt_compare <- selected_adt_summary %>%
-  select(
-    direction,
-    direction_label,
-    facility,
-    avg_adt_per_station,
-    avg_daily_speed_mph,
-    stations_used
-  ) %>%
-  pivot_wider(
-    names_from = facility,
-    values_from = c(
-      avg_adt_per_station,
-      avg_daily_speed_mph,
-      stations_used
-    )
-  ) %>%
-  clean_names() %>%
-  arrange(direction)
+## Complete station x week grid ----
+#
+# Important because a station with no observations still needs to appear as
+# unhealthy instead of disappearing from the table.
 
-print_table("Selected station managed lane vs GP ADT comparison:", selected_adt_compare)
-
-
-# Time-of-day performance summary ----
-
-## Time-of-day comparison by direction and facility.
-## Average hourly volume is included because time-of-day periods have different lengths.
-
-selected_station_tod_summary <- i15_selected %>%
-  group_by(
-    direction,
-    direction_label,
-    facility,
-    station_id,
-    corridor_mile,
-    station_name,
-    tod
-  ) %>%
-  summarise(
-    avg_speed_mph = weighted_speed(avg_speed_mph, total_flow_vph),
-    avg_travel_time_min_per_mile = 60 / avg_speed_mph,
-    total_volume = sum(total_flow_vph, na.rm = TRUE),
-    avg_hourly_volume_vph = mean(total_flow_vph, na.rm = TRUE),
-    avg_daily_period_volume =
-      sum(total_flow_vph, na.rm = TRUE) / n_distinct(date),
-    station_hours = n_distinct(ts),
-    days_observed = n_distinct(date),
-    .groups = "drop"
-  ) %>%
-  arrange(direction, facility, corridor_mile, tod)
-
-print_table("Selected station time-of-day summary:", selected_station_tod_summary, n = 150)
-
-
-selected_tod_summary <- selected_station_tod_summary %>%
-  group_by(direction, direction_label, facility, tod) %>%
-  summarise(
-    avg_speed_mph = weighted_speed(avg_speed_mph, total_volume),
-    avg_travel_time_min_per_mile = 60 / avg_speed_mph,
-    avg_hourly_volume_per_station =
-      weighted.mean(avg_hourly_volume_vph, w = station_hours, na.rm = TRUE),
-    avg_daily_period_volume_per_station =
-      mean(avg_daily_period_volume, na.rm = TRUE),
-    stations_used = n_distinct(station_id),
-    .groups = "drop"
-  ) %>%
-  arrange(direction, facility, tod)
-
-print_table("Selected station time-of-day performance summary:", selected_tod_summary)
-
-
-selected_tod_compare <- selected_tod_summary %>%
-  select(
-    direction,
-    direction_label,
-    tod,
-    facility,
-    avg_speed_mph,
-    avg_travel_time_min_per_mile,
-    avg_hourly_volume_per_station,
-    avg_daily_period_volume_per_station,
-    stations_used
-  ) %>%
-  pivot_wider(
-    names_from = facility,
-    values_from = c(
-      avg_speed_mph,
-      avg_travel_time_min_per_mile,
-      avg_hourly_volume_per_station,
-      avg_daily_period_volume_per_station,
-      stations_used
-    )
-  ) %>%
-  clean_names() %>%
-  mutate(
-    managed_minus_gp_speed_mph =
-      avg_speed_mph_managed_lane - avg_speed_mph_gp,
-    managed_time_savings_min_per_mile =
-      avg_travel_time_min_per_mile_gp -
-      avg_travel_time_min_per_mile_managed_lane,
-    managed_to_gp_hourly_volume_ratio =
-      avg_hourly_volume_per_station_managed_lane /
-      avg_hourly_volume_per_station_gp
-  ) %>%
-  arrange(direction, tod)
-
-print_table("Selected station managed lane vs GP time-of-day comparison:", selected_tod_compare)
-
-
-# Closest-station pair comparison ----
-
-## This table compares each managed-lane station directly with its nearest GP station.
-
-ml_tod_performance <- selected_station_tod_summary %>%
-  filter(facility == "Managed Lane") %>%
-  select(
-    direction,
-    tod,
-    ml_station_id = station_id,
-    ml_speed_mph = avg_speed_mph,
-    ml_travel_time_min_per_mile = avg_travel_time_min_per_mile,
-    ml_avg_hourly_volume_vph = avg_hourly_volume_vph,
-    ml_avg_daily_period_volume = avg_daily_period_volume,
-    ml_station_hours = station_hours,
-    ml_days_observed = days_observed
-  )
-
-
-gp_tod_performance <- selected_station_tod_summary %>%
-  filter(facility == "GP") %>%
-  select(
-    direction,
-    tod,
-    gp_station_id = station_id,
-    gp_speed_mph = avg_speed_mph,
-    gp_travel_time_min_per_mile = avg_travel_time_min_per_mile,
-    gp_avg_hourly_volume_vph = avg_hourly_volume_vph,
-    gp_avg_daily_period_volume = avg_daily_period_volume,
-    gp_station_hours = station_hours,
-    gp_days_observed = days_observed
-  )
-
-
-closest_station_pair_tod_compare <- closest_gp_to_ml %>%
-  select(
-    direction,
-    direction_label,
-    ml_station_id,
-    ml_post_mile,
-    ml_station_name,
-    gp_station_id,
-    gp_post_mile,
-    gp_station_name,
-    station_distance_mi
+station_week_health <- crossing(
+  station_ids,
+  analysis_weeks %>% select(fiscal_year, week_start, week_end, week_label)
+) %>%
+  left_join(
+    week_expected_hours,
+    by = c("fiscal_year", "week_start", "week_end", "week_label")
   ) %>%
   left_join(
-    ml_tod_performance,
-    by = c("direction", "ml_station_id")
-  ) %>%
-  left_join(
-    gp_tod_performance,
-    by = c("direction", "gp_station_id", "tod")
-  ) %>%
-  mutate(
-    managed_minus_gp_speed_mph =
-      ml_speed_mph - gp_speed_mph,
-    managed_time_savings_min_per_mile =
-      gp_travel_time_min_per_mile -
-      ml_travel_time_min_per_mile,
-    managed_to_gp_hourly_volume_ratio =
-      ml_avg_hourly_volume_vph /
-      gp_avg_hourly_volume_vph
-  ) %>%
-  arrange(direction, ml_post_mile, tod)
-
-print_table("Closest station pair time-of-day comparison:", closest_station_pair_tod_compare, n = 150)
-
-
-# Reporting tables ----
-
-## Clean ADT table.
-
-selected_adt_doc <- selected_adt_summary %>%
-  transmute(
-    Direction = case_when(
-      direction == "N" ~ "NB",
-      direction == "S" ~ "SB",
-      TRUE ~ direction
-    ),
-    Facility = case_when(
-      facility == "Managed Lane" ~ "ML",
-      TRUE ~ as.character(facility)
-    ),
-    `Avg. ADT per Station` = round(avg_adt_per_station, 0),
-    `Avg. Daily Speed (mph)` = round(avg_daily_speed_mph, 1),
-    `Stations Used` = stations_used,
-    `Days Observed` = days_observed
-  ) %>%
-  arrange(Direction, Facility)
-
-print_table("Selected station ADT and speed documentation table:", selected_adt_doc)
-
-
-## Clean time-of-day comparison table.
-## Travel-time savings are converted to seconds per mile for easier interpretation.
-
-selected_tod_compare_doc <- selected_tod_compare %>%
-  transmute(
-    Direction = case_when(
-      direction == "N" ~ "NB",
-      direction == "S" ~ "SB",
-      TRUE ~ direction
-    ),
-    Period = as.character(tod),
-    
-    `GP Speed (mph)` = round(avg_speed_mph_gp, 1),
-    `ML Speed (mph)` = round(avg_speed_mph_managed_lane, 1),
-    `ML - GP Speed (mph)` = round(managed_minus_gp_speed_mph, 1),
-    
-    `GP Travel Time (min/mi)` = round(avg_travel_time_min_per_mile_gp, 3),
-    `ML Travel Time (min/mi)` = round(avg_travel_time_min_per_mile_managed_lane, 3),
-    `ML Savings (sec/mi)` = round(managed_time_savings_min_per_mile * 60, 1),
-    
-    `GP Avg. Hourly Volume` = round(avg_hourly_volume_per_station_gp, 0),
-    `ML Avg. Hourly Volume` = round(avg_hourly_volume_per_station_managed_lane, 0),
-    `ML / GP Volume Ratio` = round(managed_to_gp_hourly_volume_ratio, 2),
-    
-    `GP Stations` = stations_used_gp,
-    `ML Stations` = stations_used_managed_lane
-  ) %>%
-  arrange(Direction, Period)
-
-print_table("Selected station time-of-day comparison documentation table:", selected_tod_compare_doc)
-
-
-# Congestion location summary ----
-
-# Lowest-speed paired location comparison ----
-
-## For each direction and time period, identify the paired ML/GP location
-## where either facility has the lowest speed.
-## Then compare ML and GP performance at that paired location.
-
-lowest_speed_pair_compare <- closest_station_pair_tod_compare %>%
-  mutate(
-    direction_short = case_when(
-      direction == "N" ~ "NB",
-      direction == "S" ~ "SB",
-      TRUE ~ direction
-    ),
-    comparison_post_mile = round((ml_post_mile + gp_post_mile) / 2, 3),
-    lowest_pair_speed_mph = pmin(ml_speed_mph, gp_speed_mph, na.rm = TRUE),
-    slowest_facility = case_when(
-      ml_speed_mph < gp_speed_mph ~ "ML",
-      gp_speed_mph < ml_speed_mph ~ "GP",
-      TRUE ~ "Tie"
-    ),
-    comparison_location = case_when(
-      slowest_facility == "ML" ~ ml_station_name,
-      slowest_facility == "GP" ~ gp_station_name,
-      TRUE ~ ml_station_name
+    station_week_health_observed,
+    by = c(
+      "fiscal_year", "week_start", "week_end", "week_label",
+      "direction", "facility", "station_id"
     )
   ) %>%
-  group_by(direction, direction_label, tod) %>%
-  slice_min(lowest_pair_speed_mph, n = 1, with_ties = FALSE) %>%
-  ungroup() %>%
-  arrange(direction, tod)
-
-
-# Top 10 slowest paired ML/GP locations ----
-
-## One row per paired physical location.
-## The table is ranked by the lowest speed observed in either GP or ML.
-## If the same location appears more than once, keep the slowest case only.
-
-paired_location_candidates <- closest_station_pair_tod_compare %>%
-  filter(
-    !is.na(gp_speed_mph),
-    !is.na(ml_speed_mph)
-  ) %>%
   mutate(
-    direction_short = case_when(
-      direction == "N" ~ "NB",
-      direction == "S" ~ "SB",
-      TRUE ~ direction
-    ),
-    comparison_post_mile = round((ml_post_mile + gp_post_mile) / 2, 3),
-    comparison_post_mile_key = sprintf("%.3f", comparison_post_mile),
-    lowest_pair_speed_mph = pmin(gp_speed_mph, ml_speed_mph),
-    slowest_facility = case_when(
-      ml_speed_mph < gp_speed_mph ~ "ML",
-      gp_speed_mph < ml_speed_mph ~ "GP",
-      TRUE ~ "Tie"
-    ),
-    location_name = case_when(
-      slowest_facility == "ML" ~ ml_station_name,
-      slowest_facility == "GP" ~ gp_station_name,
-      TRUE ~ ml_station_name
-    )
+    complete_hours = coalesce(complete_hours, 0L),
+    share_complete = complete_hours / expected_hours,
+    healthy = share_complete >= health_threshold
   )
 
 
-top10_slowest_paired_locations <- paired_location_candidates %>%
-  arrange(
-    lowest_pair_speed_mph,
-    desc(abs(managed_minus_gp_speed_mph))
-  ) %>%
-  distinct(
-    direction_short,
-    comparison_post_mile_key,
-    .keep_all = TRUE
-  ) %>%
-  slice_head(n = 10) %>%
+## EL weekly health ----
+
+el_week_health <- station_week_health %>%
+  filter(facility == "Express Lane") %>%
   transmute(
-    Direction = direction_short,
-    Period = as.character(tod),
-    Location = location_name,
-    `Post Mile` = comparison_post_mile,
-    `Slowest Facility` = slowest_facility,
-    `GP Speed (mph)` = round(gp_speed_mph, 1),
-    `ML Speed (mph)` = round(ml_speed_mph, 1),
-    `ML - GP Speed (mph)` = round(managed_minus_gp_speed_mph, 1)
-  )
-
-print_table("Top 10 slowest paired ML/GP locations:", top10_slowest_paired_locations, n = 20)
-
-
-# Map I-15 and selected PeMS stations ----
-
-library(tidyverse)
-library(sf)
-library(ggplot2)
-
-
-# Caltrans State Highway Network Lines ----
-
-## Caltrans SHN Lines FeatureServer.
-## Query I-15 in District 11 and request GeoJSON in WGS84.
-
-shn_query_url <- paste0(
-  "https://caltrans-gis.dot.ca.gov/arcgis/rest/services/CHhighway/SHN_Lines/FeatureServer/0/query?",
-  "where=", URLencode("Route = 15 AND District = 11", reserved = TRUE),
-  "&outFields=Route,RouteS,County,District,bPM,ePM,Direction,AlignCode",
-  "&returnGeometry=true",
-  "&outSR=4326",
-  "&f=geojson"
-)
-
-i15_shn <- st_read(shn_query_url, quiet = TRUE) %>%
-  st_make_valid()
-
-
-# Station points ----
-
-## Use selected_station_table if we want the stations used in the analysis.
-## Use healthy_station_location_table if we want all healthy stations.
-
-stations_to_map <- selected_station_table %>%
-  mutate(
-    direction_short = case_when(
-      direction == "N" ~ "NB",
-      direction == "S" ~ "SB",
-      TRUE ~ direction
-    ),
-    facility_short = case_when(
-      facility == "Managed Lane" ~ "ML",
-      facility == "GP" ~ "GP",
-      TRUE ~ as.character(facility)
-    ),
-    map_label = paste0(direction_short, " ", facility_short, " PM ", round(post_mile, 1))
-  ) %>%
-  filter(
-    !is.na(latitude),
-    !is.na(longitude)
-  ) %>%
-  st_as_sf(
-    coords = c("longitude", "latitude"),
-    crs = 4326,
-    remove = FALSE
+    fiscal_year, week_start, week_end, week_label, direction,
+    el_station_id = station_id,
+    el_healthy = healthy
   )
 
 
-# Map extent ----
+## GP weekly health ----
 
-map_bbox <- st_bbox(stations_to_map)
-
-
-# Map: selected GP and ML stations with stronger label repel ----
-
-library(ggrepel)
-
-## Label dataframe for ggrepel.
-## Use one combined label layer so GP and ML labels repel from each other.
-
-stations_label_df <- stations_to_map %>%
-  st_drop_geometry() %>%
-  mutate(
-    map_label = station_name
-  )
-
-## More map padding so labels have room to move.
-
-x_pad <- 0.14
-y_pad <- 0.06
-
-
-p_i15_selected_stations <- ggplot() +
-  geom_sf(
-    data = i15_shn,
-    linewidth = 0.8
-  ) +
-  geom_sf(
-    data = stations_to_map,
-    aes(shape = facility_short),
-    size = 2.8
-  ) +
-  
-  ## One combined repel layer.
-  geom_label_repel(
-    data = stations_label_df,
-    aes(
-      x = longitude,
-      y = latitude,
-      label = map_label
-    ),
-    size = 2.2,
-    label.size = 0.15,
-    label.padding = unit(0.12, "lines"),
-    box.padding = 0.9,
-    point.padding = 0.7,
-    min.segment.length = 0,
-    segment.size = 0.25,
-    force = 25,
-    force_pull = 0.03,
-    max.iter = 20000,
-    max.time = 5,
-    max.overlaps = Inf,
-    direction = "both",
-    seed = 123
-  ) +
-  
-  coord_sf(
-    xlim = c(map_bbox["xmin"] - x_pad, map_bbox["xmax"] + x_pad),
-    ylim = c(map_bbox["ymin"] - y_pad, map_bbox["ymax"] + y_pad),
-    expand = FALSE,
-    clip = "off"
-  ) +
-  facet_wrap(~ direction_short) +
-  labs(
-    title = "I-15 Selected PeMS Station Locations",
-    subtitle = "Selected healthy managed-lane stations and nearest healthy GP stations",
-    x = NULL,
-    y = NULL,
-    shape = "Facility"
-  ) +
-  theme_minimal(base_size = 12) +
-  theme(
-    plot.title = element_text(face = "bold"),
-    legend.position = "bottom",
-    panel.grid = element_blank(),
-    plot.margin = margin(10, 40, 10, 40)
-  )
-
-print(p_i15_selected_stations)
-
-# Station-pair speed and ADT CSV ----
-
-## Creates one row per ML/GP station pair by time of day.
-## Location is always the ML station name.
-## ADT is average daily volume during that time-of-day period.
-## Volumes are not lane-normalized.
-
-if (!exists("i15_selected")) {
-  stop("Object `i15_selected` does not exist. Run the selected station analysis first.")
-}
-
-if (!exists("closest_gp_to_ml")) {
-  stop("Object `closest_gp_to_ml` does not exist. Run the station-pair selection first.")
-}
-
-analysis_output_dir <- file.path("4_Outputs")
-dir.create(analysis_output_dir, showWarnings = FALSE, recursive = TRUE)
-
-
-# Build clean station-pair lookup ----
-
-## Each ML station gets one nearest GP station.
-## The location field is the ML station name.
-
-station_pair_lookup <- closest_gp_to_ml %>%
-  transmute(
-    direction,
-    direction_label,
-    ml_station_id,
-    gp_station_id,
-    location = ml_station_name,
-    post_mile = ml_post_mile,
-    ml_station_name,
-    gp_station_name,
-    ml_post_mile,
-    gp_post_mile,
-    station_distance_mi
-  ) %>%
-  distinct(
-    direction,
-    ml_station_id,
-    gp_station_id,
-    .keep_all = TRUE
-  ) %>%
-  arrange(direction, post_mile)
-
-
-print_table("Station pair lookup:", station_pair_lookup, n = 100)
-
-
-# Station-day-period performance ----
-
-## First calculate daily period volume and speed for each station.
-
-station_day_tod <- i15_selected %>%
-  group_by(
-    date,
-    direction,
-    direction_label,
-    facility,
-    station_id,
-    tod
-  ) %>%
-  summarise(
-    daily_period_volume = sum(total_flow_vph, na.rm = TRUE),
-    daily_period_speed = weighted_speed(avg_speed_mph, total_flow_vph),
-    .groups = "drop"
-  )
-
-
-# Station-level time-of-day summary ----
-
-## Average across days for each station and time period.
-
-station_tod_summary <- station_day_tod %>%
-  group_by(
-    direction,
-    direction_label,
-    facility,
-    station_id,
-    tod
-  ) %>%
-  summarise(
-    speed_mph = weighted_speed(daily_period_speed, daily_period_volume),
-    adt = mean(daily_period_volume, na.rm = TRUE),
-    days_observed = n_distinct(date),
-    .groups = "drop"
-  )
-
-
-# Split GP and ML station summaries ----
-
-ml_tod_summary <- station_tod_summary %>%
-  filter(facility == "Managed Lane") %>%
-  transmute(
-    direction,
-    tod,
-    ml_station_id = station_id,
-    ml_speed_mph = speed_mph,
-    ml_adt = adt,
-    ml_days_observed = days_observed
-  )
-
-
-gp_tod_summary <- station_tod_summary %>%
+gp_week_health <- station_week_health %>%
   filter(facility == "GP") %>%
   transmute(
-    direction,
-    tod,
+    fiscal_year, week_start, week_end, week_label, direction,
     gp_station_id = station_id,
-    gp_speed_mph = speed_mph,
-    gp_adt = adt,
-    gp_days_observed = days_observed
+    gp_healthy = healthy
   )
 
 
-# Join GP and ML performance to each station pair ----
+## Evaluate EL / GP pair health ----
+#
+# Both stations need to be healthy. No substitution of alternate stations.
 
-station_pair_tod_speed_adt <- station_pair_lookup %>%
-  left_join(
-    ml_tod_summary,
-    by = c("direction", "ml_station_id")
-  ) %>%
-  left_join(
-    gp_tod_summary,
-    by = c("direction", "gp_station_id", "tod")
-  ) %>%
-  mutate(
-    direction_short = case_when(
-      direction == "N" ~ "NB",
-      direction == "S" ~ "SB",
-      TRUE ~ direction
-    ),
-    time_of_day = as.character(tod),
-    ml_minus_gp_speed_mph = ml_speed_mph - gp_speed_mph,
-    ml_to_gp_adt_ratio = ml_adt / gp_adt
-  ) %>%
-  distinct(
-    direction_short,
-    ml_station_id,
-    gp_station_id,
-    time_of_day,
-    .keep_all = TRUE
-  ) %>%
-  transmute(
-    direction = direction_short,
-    location,
-    post_mile = round(post_mile, 3),
-    time_of_day,
-    
-    gp_speed_mph = round(gp_speed_mph, 1),
-    ml_speed_mph = round(ml_speed_mph, 1),
-    ml_minus_gp_speed_mph = round(ml_minus_gp_speed_mph, 1),
-    
-    gp_adt = round(gp_adt, 0),
-    ml_adt = round(ml_adt, 0),
-    ml_to_gp_adt_ratio = round(ml_to_gp_adt_ratio, 2),
-    
-    gp_station_id,
-    ml_station_id,
-    station_distance_mi = round(station_distance_mi, 3),
-    gp_days_observed,
-    ml_days_observed
-  ) %>%
-  mutate(
-    time_of_day = factor(
-      time_of_day,
-      levels = c("AM Peak", "PM Peak", "Off-Peak")
-    )
-  ) %>%
-  arrange(
-    direction,
-    post_mile,
-    time_of_day
-  )
-
-
-# Duplicate QA ----
-
-## There should be only one row per direction / ML station / GP station / time period.
-
-station_pair_duplicate_check <- station_pair_tod_speed_adt %>%
-  count(
-    direction,
-    ml_station_id,
-    gp_station_id,
-    time_of_day,
-    name = "rows"
-  ) %>%
-  filter(rows > 1)
-
-print_table("Station pair duplicate check:", station_pair_duplicate_check)
-
-if (nrow(station_pair_duplicate_check) > 0) {
-  warning("Duplicate station-pair/time-of-day rows found.")
-}
-
-
-# Simple output table ----
-
-## This is the clean CSV requested.
-
-station_pair_tod_speed_adt_simple <- station_pair_tod_speed_adt %>%
-  select(
-    direction,
-    location,
-    post_mile,
-    time_of_day,
-    gp_speed_mph,
-    ml_speed_mph,
-    ml_minus_gp_speed_mph,
-    gp_adt,
-    ml_adt
-  )
-
-
-print_table(
-  "Station-pair speed and ADT CSV preview:",
-  station_pair_tod_speed_adt_simple,
-  n = 100
-)
-
-
-# Write CSV ----
-
-station_pair_tod_csv_path <- file.path(
-  analysis_output_dir,
-  "i15_station_pair_tod_speed_adt.csv"
-)
-
-write_csv(
-  station_pair_tod_speed_adt_simple,
-  station_pair_tod_csv_path
-)
-
-cat("\nStation-pair speed and ADT CSV written to:\n")
-cat(station_pair_tod_csv_path, "\n")
-
-
-# Station-pair speed and ADT by fiscal year ----
-
-## Creates:
-##   FY23 = July 1, 2022 through June 30, 2023
-##   FY24 = July 1, 2023 through June 30, 2024
-##   FY25 = July 1, 2024 through June 30, 2025
-##
-## FY25 currently has no June 2025 data.
-##
-## The primary workbook table has one row per station pair and time period,
-## with separate GP and ML columns for each fiscal year.
-
-
-# Required objects ----
-
-if (!exists("i15_selected")) {
-  stop("Object `i15_selected` does not exist. Run the selected-station analysis first.")
-}
-
-if (!exists("closest_gp_to_ml")) {
-  stop("Object `closest_gp_to_ml` does not exist. Run the station-pair selection first.")
-}
-
-if (!exists("i15_analysis_base")) {
-  stop("Object `i15_analysis_base` does not exist. Run the analysis-base section first.")
-}
-
-
-# Output folder ----
-
-analysis_output_dir <- file.path(
-  "4_Outputs")
-
-dir.create(
-  analysis_output_dir,
-  showWarnings = FALSE,
-  recursive = TRUE
-)
-
-
-# Long-format fiscal-year comparison ----
-
-## One row per station pair, time period, and fiscal year.
-
-station_pair_tod_fy_long <- station_pair_lookup %>%
+pair_week_health <- fixed_station_pairs %>%
   crossing(
-    fiscal_year = factor(
-      c("FY24", "FY25", "FY26"),
-      levels = c("FY24", "FY25", "FY26")
-    ),
-    tod = factor(
-      c("AM Peak", "PM Peak", "Off-Peak"),
-      levels = c("AM Peak", "PM Peak", "Off-Peak")
+    analysis_weeks %>% select(fiscal_year, week_start, week_end, week_label)
+  ) %>%
+  left_join(
+    el_week_health,
+    by = c(
+      "fiscal_year", "week_start", "week_end", "week_label",
+      "direction", "el_station_id"
     )
   ) %>%
   left_join(
-    ml_tod_summary_fy,
+    gp_week_health,
     by = c(
-      "fiscal_year",
-      "direction",
-      "tod",
-      "ml_station_id"
-    )
-  ) %>%
-  left_join(
-    gp_tod_summary_fy,
-    by = c(
-      "fiscal_year",
-      "direction",
-      "tod",
-      "gp_station_id"
+      "fiscal_year", "week_start", "week_end", "week_label",
+      "direction", "gp_station_id"
     )
   ) %>%
   mutate(
-    direction_short = case_when(
-      direction == "N" ~ "NB",
-      direction == "S" ~ "SB",
-      TRUE ~ direction
-    ),
-    time_of_day = as.character(tod),
-    ml_minus_gp_speed_mph =
-      ml_speed_mph - gp_speed_mph,
-    ml_to_gp_adt_ratio =
-      ml_adt / gp_adt
-  ) %>%
-  transmute(
-    direction = direction_short,
-    location,
-    post_mile = round(post_mile, 3),
-    time_of_day,
-    fiscal_year = as.character(fiscal_year),
-    
-    gp_speed_mph = round(gp_speed_mph, 1),
-    ml_speed_mph = round(ml_speed_mph, 1),
-    ml_minus_gp_speed_mph =
-      round(ml_minus_gp_speed_mph, 1),
-    
-    gp_adt = round(gp_adt, 0),
-    ml_adt = round(ml_adt, 0),
-    ml_to_gp_adt_ratio =
-      round(ml_to_gp_adt_ratio, 2),
-    
-    gp_days_observed,
-    ml_days_observed,
-    gp_station_id,
-    ml_station_id,
-    station_distance_mi =
-      round(station_distance_mi, 3)
-  ) %>%
-  mutate(
-    fiscal_year = factor(
-      fiscal_year,
-      levels = c("FY24", "FY25", "FY26")
-    ),
-    time_of_day = factor(
-      time_of_day,
-      levels = c(
-        "AM Peak",
-        "PM Peak",
-        "Off-Peak"
-      )
-    )
-  ) %>%
-  arrange(
-    direction,
-    post_mile,
-    time_of_day,
-    fiscal_year
+    el_healthy = coalesce(el_healthy, FALSE),
+    gp_healthy = coalesce(gp_healthy, FALSE),
+    pair_healthy = el_healthy & gp_healthy
   )
 
 
-# Duplicate QA ----
+## Build station-pair health matrix ----
 
-station_pair_duplicate_check <- station_pair_tod_fy_long %>%
-  count(
-    direction,
-    ml_station_id,
-    gp_station_id,
-    time_of_day,
-    fiscal_year,
-    name = "rows"
-  ) %>%
-  filter(rows > 1)
+week_levels <- analysis_weeks %>% arrange(week_start) %>% pull(week_label)
 
-print_table(
-  "Fiscal-year station-pair duplicate check:",
-  station_pair_duplicate_check
-)
-
-if (nrow(station_pair_duplicate_check) > 0) {
-  warning(
-    "Duplicate station-pair, time-of-day, and fiscal-year rows found."
-  )
-}
-
-
-# Wide fiscal-year comparison table ----
-
-## GP and ML speeds receive separate columns for each fiscal year,
-## using suffixes such as:
-##
-##   gp_speed_mph_FY24
-##   ml_speed_mph_FY24
-##   gp_speed_mph_FY25
-##   ml_speed_mph_FY25
-##   gp_speed_mph_FY26
-##   ml_speed_mph_FY26
-##
-## ADT and the ML-GP speed difference are also separated by fiscal year
-## so all measures use the same underlying time period.
-
-station_pair_tod_fy_wide <- station_pair_tod_fy_long %>%
+station_pair_matrix <- pair_week_health %>%
+  mutate(week_label = factor(week_label, levels = week_levels)) %>%
   select(
-    direction,
-    location,
-    post_mile,
-    time_of_day,
-    fiscal_year,
-    gp_speed_mph,
-    ml_speed_mph,
-    ml_minus_gp_speed_mph,
-    gp_adt,
-    ml_adt,
-    ml_to_gp_adt_ratio
+    direction_label,
+    el_station_name,
+    el_station_id,
+    gp_station_name,
+    gp_station_id,
+    week_label,
+    pair_healthy
   ) %>%
   pivot_wider(
-    names_from = fiscal_year,
-    values_from = c(
-      gp_speed_mph,
-      ml_speed_mph,
-      ml_minus_gp_speed_mph,
-      gp_adt,
-      ml_adt,
-      ml_to_gp_adt_ratio
-    ),
-    names_glue = "{.value}_{fiscal_year}",
+    names_from = week_label,
+    values_from = pair_healthy,
+    values_fill = FALSE,
     names_expand = TRUE
   ) %>%
-  select(
-    direction,
-    location,
-    post_mile,
-    time_of_day,
-    
-    gp_speed_mph_FY24,
-    ml_speed_mph_FY24,
-    ml_minus_gp_speed_mph_FY24,
-    gp_adt_FY24,
-    ml_adt_FY24,
-    ml_to_gp_adt_ratio_FY24,
-    
-    gp_speed_mph_FY25,
-    ml_speed_mph_FY25,
-    ml_minus_gp_speed_mph_FY25,
-    gp_adt_FY25,
-    ml_adt_FY25,
-    ml_to_gp_adt_ratio_FY25,
-    
-    gp_speed_mph_FY26,
-    ml_speed_mph_FY26,
-    ml_minus_gp_speed_mph_FY26,
-    gp_adt_FY26,
-    ml_adt_FY26,
-    ml_to_gp_adt_ratio_FY26
+  rename(
+    Direction = direction_label,
+    `EL Station` = el_station_name,
+    `EL ID` = el_station_id,
+    `GP Station` = gp_station_name,
+    `GP ID` = gp_station_id
   ) %>%
-  arrange(
-    direction,
-    post_mile,
-    time_of_day
-  )
+  arrange(Direction, `EL Station`)
 
-print_table(
-  "Station-pair fiscal-year comparison:",
-  station_pair_tod_fy_wide,
-  n = 100
+
+## Export station health matrix ----
+
+print(station_pair_matrix, n = Inf, width = Inf)
+
+write.csv(
+  station_pair_matrix,
+  file.path(output_dir, "station_pair_matrix.csv"),
+  row.names = FALSE
 )
 
+cat("\nStation health matrix saved:\n", file.path(output_dir, "station_pair_matrix.csv"), "\n")
 
-# Workbook notes ----
 
-fy26_coverage_description <- fiscal_year_coverage %>%
-  filter(as.character(fiscal_year) == "FY26") %>%
+# Section 3 - Selected analysis weeks ----
+#
+# After reviewing station health we selected representative weeks for July,
+# October, December and March.
+#
+# Selection favored weeks with good station availability and avoided federal
+# holidays and the beginning / end of major school breaks.
+#
+# The reviewed selections are stored in week_selection.csv.
+#
+# station_selection.csv is the reviewed health matrix used from this point
+# forward. Weekly health is NOT recalculated again below.
+
+
+## Read reviewed health matrix ----
+
+station_health <- read_csv(
+  file.path(clean_dir, "station_selection.csv"),
+  show_col_types = FALSE
+) %>%
+  mutate(
+    `EL ID` = as.character(`EL ID`),
+    `GP ID` = as.character(`GP ID`)
+  )
+
+
+## Read selected weeks ----
+
+week_selection <- read_csv(
+  file.path(clean_dir, "week_selection.csv"),
+  show_col_types = FALSE
+) %>%
+  rename(
+    fiscal_year = `Fiscal Year`,
+    analysis_month = Month,
+    week_name = Week,
+    week_start = `Week Start`
+  ) %>%
+  mutate(
+    week_start = parse_date_time(as.character(week_start), orders = c("mdy", "ymd")) %>% as_date(),
+    analysis_month = factor(analysis_month, levels = month_order)
+  ) %>%
+  filter(!is.na(week_start)) %>%
+  arrange(fiscal_year, analysis_month, week_start)
+
+
+## Station pair lookup ----
+
+station_pairs <- station_health %>%
+  select(Direction, `EL Station`, `EL ID`, `GP Station`, `GP ID`) %>%
+  distinct() %>%
   transmute(
-    description = paste0(
-      coverage_status,
-      ": ",
-      coverage_note
+    direction_label = Direction,
+    
+    direction = case_when(
+      Direction == "Northbound" ~ "N",
+      Direction == "Southbound" ~ "S",
+      TRUE ~ NA_character_
+    ),
+    
+    el_station = `EL Station`,
+    el_id = as.character(`EL ID`),
+    gp_station = `GP Station`,
+    gp_id = as.character(`GP ID`)
+  )
+
+
+## Convert reviewed health matrix to long format ----
+
+station_health_long <- station_health %>%
+  pivot_longer(
+    cols = matches("^FY\\d{2} \\|"),
+    names_to = "week_label",
+    values_to = "pair_healthy"
+  ) %>%
+  separate(week_label, into = c("fiscal_year", "week_start"), sep = " \\| ") %>%
+  mutate(
+    week_start = ymd(week_start),
+    
+    pair_healthy = as.character(pair_healthy) %in%
+      c("TRUE", "True", "true", "YES", "Yes", "yes", "1")
+  ) %>%
+  transmute(
+    fiscal_year,
+    week_start,
+    direction_label = Direction,
+    el_station = `EL Station`,
+    el_id = as.character(`EL ID`),
+    gp_station = `GP Station`,
+    gp_id = as.character(`GP ID`),
+    pair_healthy
+  )
+
+
+## Match health matrix to selected weeks ----
+
+selected_weeks_long <- station_health_long %>%
+  inner_join(week_selection, by = c("fiscal_year", "week_start")) %>%
+  mutate(analysis_month = factor(analysis_month, levels = month_order))
+
+
+## QA check - selected weeks exist in health table ----
+
+week_check <- week_selection %>%
+  anti_join(
+    station_health_long %>% distinct(fiscal_year, week_start),
+    by = c("fiscal_year", "week_start")
+  )
+
+if (nrow(week_check) > 0) {
+  print(week_check, n = Inf)
+  stop("One or more selected weeks are missing from station_selection.csv.")
+}
+
+
+# Section 4 - Prepare selected-week PeMS data ----
+
+## Add calendar fields and hour-level validity ----
+#
+# Same validity rules used above. Weekly pair health still comes from the
+# reviewed health matrix.
+
+i15_master <- i15_master %>%
+  mutate(
+    week_start = floor_date(date, unit = "week", week_start = 1) %>% as_date(),
+    weekday_num = wday(date, week_start = 1),
+    
+    weekday = case_when(
+      weekday_num == 1 ~ "Monday",
+      weekday_num == 2 ~ "Tuesday",
+      weekday_num == 3 ~ "Wednesday",
+      weekday_num == 4 ~ "Thursday",
+      weekday_num == 5 ~ "Friday",
+      weekday_num == 6 ~ "Saturday",
+      weekday_num == 7 ~ "Sunday"
+    ),
+    
+    day_group = case_when(
+      weekday_num %in% c(1, 5) ~ "Monday / Friday",
+      weekday_num %in% 2:4 ~ "Tuesday - Thursday",
+      weekday_num %in% 6:7 ~ "Saturday / Sunday"
+    ),
+    
+    hour = hour(ts),
+    
+    time_period = case_when(
+      hour %in% 6:9 ~ "AM Peak",
+      hour %in% 10:14 ~ "Midday",
+      hour %in% 15:18 ~ "PM Peak",
+      TRUE ~ NA_character_
+    ),
+    
+    complete =
+      !is.na(pct_observed) &
+      pct_observed >= min_hour_pct_observed &
+      !is.na(samples) &
+      samples > 0 &
+      !is.na(avg_speed_mph) &
+      avg_speed_mph > 0 &
+      !is.na(total_flow_vph) &
+      total_flow_vph >= 0
+  )
+
+
+## Keep selected calendar weeks ----
+
+selected_data <- i15_master %>%
+  semi_join(week_selection %>% distinct(week_start), by = "week_start")
+
+
+## Selected station IDs ----
+
+selected_station_ids <- bind_rows(
+  station_pairs %>% transmute(direction, facility = "Express Lane", station_id = el_id),
+  station_pairs %>% transmute(direction, facility = "GP", station_id = gp_id)
+) %>%
+  distinct()
+
+
+# Section 5 - Selected-week variation ----
+#
+# Before building the final reporting table we looked at how stable the
+# selected weeks actually were.
+#
+# Daily values let us compare individual selected weeks.
+# Monthly summary statistics use the underlying hourly observations.
+# They are not averages of the daily or weekly averages.
+
+
+## Daily station averages ----
+
+daily_station_performance <- selected_data %>%
+  semi_join(selected_station_ids, by = c("direction", "facility", "station_id")) %>%
+  filter(complete, !is.na(time_period)) %>%
+  group_by(week_start, date, weekday, day_group, direction, facility, station_id, time_period) %>%
+  summarise(
+    speed_avg = mean(avg_speed_mph),
+    vph_avg = mean(total_flow_vph),
+    .groups = "drop"
+  )
+
+
+## Underlying hourly observations ----
+
+hourly_station_performance <- selected_data %>%
+  semi_join(selected_station_ids, by = c("direction", "facility", "station_id")) %>%
+  filter(complete, !is.na(time_period)) %>%
+  select(
+    week_start,
+    date,
+    weekday,
+    day_group,
+    direction,
+    facility,
+    station_id,
+    time_period,
+    avg_speed_mph,
+    total_flow_vph
+  )
+
+
+## EL daily values ----
+
+el_daily <- daily_station_performance %>%
+  filter(facility == "Express Lane") %>%
+  transmute(
+    week_start, date, weekday, day_group, direction, time_period,
+    el_id = station_id,
+    el_speed_avg = speed_avg,
+    el_vph_avg = vph_avg
+  )
+
+
+## GP daily values ----
+
+gp_daily <- daily_station_performance %>%
+  filter(facility == "GP") %>%
+  transmute(
+    week_start, date, weekday, day_group, direction, time_period,
+    gp_id = station_id,
+    gp_speed_avg = speed_avg,
+    gp_vph_avg = vph_avg
+  )
+
+
+## Build complete station / week / day grid ----
+#
+# Unhealthy station-weeks remain structurally present but their values are blank.
+
+daily_pair_performance <- selected_weeks_long %>%
+  crossing(weekday = weekday_order, time_period = time_periods) %>%
+  mutate(
+    weekday_num = match(weekday, weekday_order),
+    date = week_start + days(weekday_num - 1),
+    
+    day_group = case_when(
+      weekday %in% c("Monday", "Friday") ~ "Monday / Friday",
+      weekday %in% c("Tuesday", "Wednesday", "Thursday") ~ "Tuesday - Thursday",
+      weekday %in% c("Saturday", "Sunday") ~ "Saturday / Sunday"
     )
   ) %>%
-  pull(description) %>%
-  first(
-    default = "No FY26 coverage information available."
-  )
-
-
-workbook_notes <- tibble(
-  item = c(
-    "Workbook purpose",
-    "FY24",
-    "FY25",
-    "FY26",
-    "FY26 coverage",
-    "Day filter",
-    "Speed calculation",
-    "ADT calculation",
-    "Station pairing"
-  ),
-  
-  description = c(
-    paste(
-      "Compares weekday GP and managed-lane performance",
-      "by station pair, time of day, and fiscal year."
-    ),
-    
-    "July 1, 2023 through June 30, 2024.",
-    
-    "July 1, 2024 through June 30, 2025.",
-    
-    "July 1, 2025 through June 30, 2026.",
-    
-    fy26_coverage_description,
-    
-    ifelse(
-      weekdays_only,
-      "Weekdays only.",
-      "All days."
-    ),
-    
-    paste(
-      "Speeds are weighted by station flow.",
-      "Only complete station-hour records are included."
-    ),
-    
-    paste(
-      "ADT represents average daily volume during the specified",
-      "time-of-day period; it is not lane-normalized."
-    ),
-    
-    paste(
-      "Each healthy managed-lane station is paired with",
-      "the nearest healthy GP station in the same direction."
+  left_join(
+    station_pairs %>% select(direction_label, direction, el_id, gp_id),
+    by = c("direction_label", "el_id", "gp_id")
+  ) %>%
+  left_join(
+    el_daily,
+    by = c(
+      "week_start", "date", "weekday", "day_group",
+      "direction", "el_id", "time_period"
     )
+  ) %>%
+  left_join(
+    gp_daily,
+    by = c(
+      "week_start", "date", "weekday", "day_group",
+      "direction", "gp_id", "time_period"
+    )
+  ) %>%
+  mutate(
+    across(
+      c(el_speed_avg, gp_speed_avg, el_vph_avg, gp_vph_avg),
+      ~ if_else(pair_healthy, .x, NA_real_)
+    ),
+    
+    column_label = paste0(as.character(analysis_month), " ", week_name, " | ", weekday)
   )
+
+
+## Daily speed values ----
+
+speed_long <- daily_pair_performance %>%
+  select(
+    fiscal_year, analysis_month, week_name, week_start, column_label,
+    direction_label, direction, el_station, el_id, gp_station, gp_id,
+    day_group, weekday, time_period, pair_healthy, el_speed_avg, gp_speed_avg
+  ) %>%
+  pivot_longer(
+    cols = c(el_speed_avg, gp_speed_avg),
+    names_to = "source_metric",
+    values_to = "numeric_value"
+  ) %>%
+  mutate(
+    metric = recode(
+      source_metric,
+      el_speed_avg = "el_speed_mph",
+      gp_speed_avg = "gp_speed_mph"
+    ),
+    
+    station_id = case_when(
+      metric == "el_speed_mph" ~ el_id,
+      metric == "gp_speed_mph" ~ gp_id
+    ),
+    
+    output_value = case_when(
+      is.na(numeric_value) ~ "",
+      TRUE ~ format(round(numeric_value, 1), nsmall = 1, trim = TRUE)
+    )
+  ) %>%
+  select(-source_metric)
+
+
+## Daily VPH values ----
+
+vph_long <- daily_pair_performance %>%
+  select(
+    fiscal_year, analysis_month, week_name, week_start, column_label,
+    direction_label, direction, el_station, el_id, gp_station, gp_id,
+    day_group, weekday, time_period, pair_healthy, el_vph_avg, gp_vph_avg
+  ) %>%
+  pivot_longer(
+    cols = c(el_vph_avg, gp_vph_avg),
+    names_to = "source_metric",
+    values_to = "numeric_value"
+  ) %>%
+  mutate(
+    metric = recode(
+      source_metric,
+      el_vph_avg = "el_vph",
+      gp_vph_avg = "gp_vph"
+    ),
+    
+    station_id = case_when(
+      metric == "el_vph" ~ el_id,
+      metric == "gp_vph" ~ gp_id
+    ),
+    
+    output_value = case_when(
+      is.na(numeric_value) ~ "",
+      TRUE ~ format(round(numeric_value, 0), scientific = FALSE, trim = TRUE)
+    )
+  ) %>%
+  select(-source_metric)
+
+
+## Healthy selected station-weeks ----
+#
+# Only TRUE pair/weeks enter the pooled monthly statistics.
+
+included_station_weeks <- selected_weeks_long %>%
+  filter(pair_healthy) %>%
+  select(
+    fiscal_year,
+    analysis_month,
+    week_start,
+    direction_label,
+    el_id,
+    gp_id
+  ) %>%
+  left_join(
+    station_pairs %>% select(direction_label, direction, el_id, gp_id),
+    by = c("direction_label", "el_id", "gp_id")
+  )
+
+
+## EL pooled monthly statistics ----
+#
+# Average, 25th, 75th, IQR, Min, Max and Count all use the same hourly pool.
+
+el_monthly_summary <- hourly_station_performance %>%
+  filter(facility == "Express Lane") %>%
+  inner_join(
+    included_station_weeks,
+    by = c("week_start", "direction", "station_id" = "el_id")
+  ) %>%
+  group_by(
+    fiscal_year,
+    analysis_month,
+    direction_label,
+    station_id,
+    day_group,
+    time_period
+  ) %>%
+  summarise(
+    speed_avg = mean(avg_speed_mph),
+    speed_p25 = quantile(avg_speed_mph, probs = 0.25, type = 7, names = FALSE),
+    speed_p75 = quantile(avg_speed_mph, probs = 0.75, type = 7, names = FALSE),
+    speed_iqr = speed_p75 - speed_p25,
+    speed_min = min(avg_speed_mph),
+    speed_max = max(avg_speed_mph),
+    speed_count = n(),
+    
+    vph_avg = mean(total_flow_vph),
+    vph_p25 = quantile(total_flow_vph, probs = 0.25, type = 7, names = FALSE),
+    vph_p75 = quantile(total_flow_vph, probs = 0.75, type = 7, names = FALSE),
+    vph_iqr = vph_p75 - vph_p25,
+    vph_min = min(total_flow_vph),
+    vph_max = max(total_flow_vph),
+    vph_count = n(),
+    
+    .groups = "drop"
+  )
+
+
+## GP pooled monthly statistics ----
+
+gp_monthly_summary <- hourly_station_performance %>%
+  filter(facility == "GP") %>%
+  inner_join(
+    included_station_weeks,
+    by = c("week_start", "direction", "station_id" = "gp_id")
+  ) %>%
+  group_by(
+    fiscal_year,
+    analysis_month,
+    direction_label,
+    station_id,
+    day_group,
+    time_period
+  ) %>%
+  summarise(
+    speed_avg = mean(avg_speed_mph),
+    speed_p25 = quantile(avg_speed_mph, probs = 0.25, type = 7, names = FALSE),
+    speed_p75 = quantile(avg_speed_mph, probs = 0.75, type = 7, names = FALSE),
+    speed_iqr = speed_p75 - speed_p25,
+    speed_min = min(avg_speed_mph),
+    speed_max = max(avg_speed_mph),
+    speed_count = n(),
+    
+    vph_avg = mean(total_flow_vph),
+    vph_p25 = quantile(total_flow_vph, probs = 0.25, type = 7, names = FALSE),
+    vph_p75 = quantile(total_flow_vph, probs = 0.75, type = 7, names = FALSE),
+    vph_iqr = vph_p75 - vph_p25,
+    vph_min = min(total_flow_vph),
+    vph_max = max(total_flow_vph),
+    vph_count = n(),
+    
+    .groups = "drop"
+  )
+
+
+## Speed monthly summary ----
+
+speed_summary <- bind_rows(
+  el_monthly_summary %>%
+    transmute(
+      fiscal_year, analysis_month, direction_label, station_id, day_group, time_period,
+      metric = "el_speed_mph",
+      monthly_avg = round(speed_avg, 1),
+      monthly_p25 = round(speed_p25, 1),
+      monthly_p75 = round(speed_p75, 1),
+      monthly_iqr = round(speed_iqr, 1),
+      monthly_min = round(speed_min, 1),
+      monthly_max = round(speed_max, 1),
+      monthly_count = speed_count
+    ),
+  
+  gp_monthly_summary %>%
+    transmute(
+      fiscal_year, analysis_month, direction_label, station_id, day_group, time_period,
+      metric = "gp_speed_mph",
+      monthly_avg = round(speed_avg, 1),
+      monthly_p25 = round(speed_p25, 1),
+      monthly_p75 = round(speed_p75, 1),
+      monthly_iqr = round(speed_iqr, 1),
+      monthly_min = round(speed_min, 1),
+      monthly_max = round(speed_max, 1),
+      monthly_count = speed_count
+    )
 )
 
 
-# Write Excel workbook ----
+## VPH monthly summary ----
 
-workbook_path <- file.path(
-  analysis_output_dir,
-  paste0(
-    "i15_station_pair_tod_speed_adt_",
-    "by_fiscal_year_FY24_FY26.xlsx"
-  )
+vph_summary <- bind_rows(
+  el_monthly_summary %>%
+    transmute(
+      fiscal_year, analysis_month, direction_label, station_id, day_group, time_period,
+      metric = "el_vph",
+      monthly_avg = round(vph_avg, 0),
+      monthly_p25 = round(vph_p25, 0),
+      monthly_p75 = round(vph_p75, 0),
+      monthly_iqr = round(vph_iqr, 0),
+      monthly_min = round(vph_min, 0),
+      monthly_max = round(vph_max, 0),
+      monthly_count = vph_count
+    ),
+  
+  gp_monthly_summary %>%
+    transmute(
+      fiscal_year, analysis_month, direction_label, station_id, day_group, time_period,
+      metric = "gp_vph",
+      monthly_avg = round(vph_avg, 0),
+      monthly_p25 = round(vph_p25, 0),
+      monthly_p75 = round(vph_p75, 0),
+      monthly_iqr = round(vph_iqr, 0),
+      monthly_min = round(vph_min, 0),
+      monthly_max = round(vph_max, 0),
+      monthly_count = vph_count
+    )
 )
 
-write_xlsx(
+
+# Section 6 - Variation workbook ----
+#
+# This workbook is primarily a QA / method-development output.
+#
+# Individual day columns let us compare the selected weeks.
+# Monthly statistics show the distribution of the underlying hourly records.
+
+
+## Function to build variation sheets ----
+
+build_output_sheet <- function(data, summary_data, selected_day_group) {
+  
+  day_data <- data %>%
+    filter(day_group == selected_day_group) %>%
+    mutate(
+      analysis_month = factor(analysis_month, levels = month_order),
+      weekday = factor(weekday, levels = weekday_order),
+      time_period = factor(time_period, levels = time_periods)
+    )
+  
+  ### Individual day averages ----
+  
+  daily_wide <- day_data %>%
+    select(
+      fiscal_year, direction_label, el_station, el_id, gp_station, gp_id,
+      day_group, time_period, metric, station_id, column_label, output_value
+    ) %>%
+    pivot_wider(
+      names_from = column_label,
+      values_from = output_value,
+      values_fill = ""
+    )
+  
+  ### Monthly pooled statistics ----
+  
+  summary_wide <- summary_data %>%
+    filter(day_group == selected_day_group) %>%
+    mutate(analysis_month = as.character(analysis_month)) %>%
+    pivot_longer(
+      cols = c(
+        monthly_avg,
+        monthly_p25,
+        monthly_p75,
+        monthly_iqr,
+        monthly_min,
+        monthly_max,
+        monthly_count
+      ),
+      names_to = "statistic",
+      values_to = "stat_value"
+    ) %>%
+    mutate(
+      statistic = recode(
+        statistic,
+        monthly_avg = "Average",
+        monthly_p25 = "25th",
+        monthly_p75 = "75th",
+        monthly_iqr = "IQR",
+        monthly_min = "Min",
+        monthly_max = "Max",
+        monthly_count = "Count"
+      ),
+      
+      summary_column = paste0(analysis_month, " - ", statistic),
+      
+      summary_value = case_when(
+        statistic == "Count" ~ format(round(stat_value, 0), scientific = FALSE, trim = TRUE),
+        TRUE ~ as.character(stat_value)
+      )
+    ) %>%
+    select(
+      fiscal_year,
+      direction_label,
+      station_id,
+      day_group,
+      time_period,
+      metric,
+      summary_column,
+      summary_value
+    ) %>%
+    pivot_wider(names_from = summary_column, values_from = summary_value)
+  
+  ### Join daily and monthly values ----
+  
+  output <- daily_wide %>%
+    left_join(
+      summary_wide,
+      by = c(
+        "fiscal_year",
+        "direction_label",
+        "station_id",
+        "day_group",
+        "time_period",
+        "metric"
+      )
+    )
+  
+  ### Desired column order ----
+  
+  value_columns <- c()
+  
+  for (this_month in month_order) {
+    
+    month_daily_columns <- day_data %>%
+      filter(as.character(analysis_month) == this_month) %>%
+      mutate(week_number = parse_number(week_name)) %>%
+      distinct(week_number, weekday, column_label) %>%
+      arrange(week_number, weekday) %>%
+      pull(column_label) %>%
+      unique()
+    
+    value_columns <- c(
+      value_columns,
+      month_daily_columns,
+      paste0(this_month, " - Average"),
+      paste0(this_month, " - 25th"),
+      paste0(this_month, " - 75th"),
+      paste0(this_month, " - IQR"),
+      paste0(this_month, " - Min"),
+      paste0(this_month, " - Max"),
+      paste0(this_month, " - Count")
+    )
+  }
+  
+  value_columns <- value_columns[value_columns %in% names(output)]
+  
+  ### Final sheet ----
+  
+  output %>%
+    select(
+      fiscal_year,
+      direction_label,
+      el_station,
+      el_id,
+      gp_station,
+      gp_id,
+      day_group,
+      time_period,
+      metric,
+      station_id,
+      all_of(value_columns)
+    ) %>%
+    select(-station_id) %>%
+    arrange(direction_label, el_station, time_period, metric, fiscal_year) %>%
+    rename(direction = direction_label)
+}
+
+
+## Build six variation tables ----
+
+mf_speed <- build_output_sheet(speed_long, speed_summary, "Monday / Friday")
+mf_vph <- build_output_sheet(vph_long, vph_summary, "Monday / Friday")
+
+tth_speed <- build_output_sheet(speed_long, speed_summary, "Tuesday - Thursday")
+tth_vph <- build_output_sheet(vph_long, vph_summary, "Tuesday - Thursday")
+
+weekend_speed <- build_output_sheet(speed_long, speed_summary, "Saturday / Sunday")
+weekend_vph <- build_output_sheet(vph_long, vph_summary, "Saturday / Sunday")
+
+
+## Variation workbook README ----
+
+variation_readme <- c(
+  "I-15 SELECTED WEEK VARIATION TABLES",
+  "",
+  "These tables show speed and traffic-volume variation across the selected analysis weeks.",
+  "",
+  "week_selection.csv determines which weeks are included.",
+  "station_selection.csv contains the reviewed weekly EL/GP station-pair health results.",
+  "TRUE indicates a healthy pair. FALSE indicates an unhealthy pair.",
+  "",
+  "Individual day columns show the average of the valid hourly observations for that day and time period.",
+  "",
+  "Monthly Average, 25th, 75th, IQR, Min, Max and Count use the same pool of underlying valid hourly observations across the selected healthy station-weeks.",
+  "Average is the pooled hourly average. It is not an average of the individual day or week averages.",
+  "IQR is the 75th percentile minus the 25th percentile.",
+  "Count is the number of hourly observations contributing to the monthly statistics.",
+  "",
+  "Unhealthy station-weeks remain in the table structure but their cells are blank."
+)
+
+
+## Export variation workbook ----
+
+variation_output_file <- file.path(output_dir, "selected_week_variation.xlsx")
+
+openxlsx::write.xlsx(
   list(
-    "FY Comparison" =
-      station_pair_tod_fy_wide,
-    
-    "Long Format" =
-      station_pair_tod_fy_long,
-    
-    "FY Coverage" =
-      fiscal_year_coverage,
-    
-    "Station Pairs" =
-      station_pair_lookup,
-    
-    "Notes" =
-      workbook_notes
+    "README" = data.frame(Notes = variation_readme, stringsAsFactors = FALSE),
+    "Week Lookup" = as.data.frame(week_selection),
+    "MF Speed" = as.data.frame(mf_speed),
+    "MF VPH" = as.data.frame(mf_vph),
+    "Tue-Thu Speed" = as.data.frame(tth_speed),
+    "Tue-Thu VPH" = as.data.frame(tth_vph),
+    "Weekend Speed" = as.data.frame(weekend_speed),
+    "Weekend VPH" = as.data.frame(weekend_vph)
   ),
-  path = workbook_path
+  file = variation_output_file,
+  overwrite = TRUE,
+  asTable = FALSE
 )
 
-cat("\nFiscal-year workbook written to:\n")
-cat(workbook_path, "\n")
+cat("\nVariation workbook saved:\n", variation_output_file, "\n")
+
+
+# Section 7 - IQR threshold review ----
+#
+# The final table cannot show every underlying observation.
+# We needed a consistent rule for when average speed alone was not enough.
+#
+# IQR is used because it describes the middle half of the observed speed
+# distribution and is less sensitive to isolated extreme observations.
+#
+# We reviewed the 75th, 80th and 90th percentile of the monthly IQR values.
+# The 6 mph final reporting rule came from the 75th-percentile speed review.
+#
+# Final rule used below:
+#   IQR < 6 mph  -> Average only
+#   IQR >= 6 mph -> Average plus 25th / 75th percentile
+
+
+## Combine row-level monthly IQR values ----
+
+iqr_distribution <- bind_rows(
+  speed_summary %>%
+    transmute(
+      fiscal_year,
+      analysis_month,
+      day_group,
+      metric_type = "Speed",
+      monthly_iqr
+    ),
+  
+  vph_summary %>%
+    transmute(
+      fiscal_year,
+      analysis_month,
+      day_group,
+      metric_type = "VPH",
+      monthly_iqr
+    )
+) %>%
+  filter(!is.na(monthly_iqr)) %>%
+  mutate(
+    analysis_month = factor(analysis_month, levels = month_order),
+    day_group = factor(day_group, levels = day_group_order)
+  )
+
+
+## IQR percentile table helper ----
+
+make_iqr_percentile_table <- function(percentile) {
+  
+  iqr_distribution %>%
+    group_by(day_group, analysis_month, metric_type) %>%
+    summarise(
+      value = quantile(
+        monthly_iqr,
+        probs = percentile,
+        type = 7,
+        na.rm = TRUE,
+        names = FALSE
+      ),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      value = case_when(
+        metric_type == "Speed" ~ round(value, 1),
+        metric_type == "VPH" ~ round(value, 0)
+      )
+    ) %>%
+    pivot_wider(names_from = analysis_month, values_from = value) %>%
+    arrange(metric_type, day_group)
+}
+
+
+## Build percentile tables ----
+
+iqr_75th <- make_iqr_percentile_table(0.75)
+iqr_80th <- make_iqr_percentile_table(0.80)
+iqr_90th <- make_iqr_percentile_table(0.90)
+
+cat("\n\n75TH PERCENTILE OF MONTHLY IQR\n\n")
+print(iqr_75th, n = Inf)
+
+cat("\n\n80TH PERCENTILE OF MONTHLY IQR\n\n")
+print(iqr_80th, n = Inf)
+
+cat("\n\n90TH PERCENTILE OF MONTHLY IQR\n\n")
+print(iqr_90th, n = Inf)
+
+
+## Export IQR review tables ----
+
+iqr_output_file <- file.path(output_dir, "iqr_percentile_tables.xlsx")
+
+openxlsx::write.xlsx(
+  list(
+    "75th" = as.data.frame(iqr_75th),
+    "80th" = as.data.frame(iqr_80th),
+    "90th" = as.data.frame(iqr_90th)
+  ),
+  file = iqr_output_file,
+  overwrite = TRUE
+)
+
+cat("\nIQR percentile workbook saved:\n", iqr_output_file, "\n")
+
+
+## Final speed reporting threshold ----
+#
+# Rounded threshold selected from the IQR review above.
+
+speed_iqr_threshold <- 6
+
+
+# Section 8 - Final speed and VPH metrics ----
+#
+# Same pooled hourly approach used in the variation analysis.
+#
+# Only selected healthy station-weeks enter these calculations.
+# Speed and VPH are calculated from the exact same hourly observations.
+
+
+## Healthy station-weeks by facility ----
+
+healthy_station_weeks <- bind_rows(
+  included_station_weeks %>%
+    transmute(
+      fiscal_year,
+      analysis_month,
+      week_start,
+      direction,
+      facility = "Express Lane",
+      station_id = as.character(el_id)
+    ),
+  
+  included_station_weeks %>%
+    transmute(
+      fiscal_year,
+      analysis_month,
+      week_start,
+      direction,
+      facility = "GP",
+      station_id = as.character(gp_id)
+    )
+) %>%
+  distinct()
+
+
+## Hourly records entering final report ----
+
+report_hourly <- hourly_station_performance %>%
+  mutate(station_id = as.character(station_id)) %>%
+  inner_join(
+    healthy_station_weeks,
+    by = c("week_start", "direction", "facility", "station_id")
+  )
+
+
+## Final period statistics ----
+
+period_summary <- report_hourly %>%
+  group_by(
+    fiscal_year,
+    analysis_month,
+    direction,
+    facility,
+    station_id,
+    day_group,
+    time_period
+  ) %>%
+  summarise(
+    avg_speed = mean(avg_speed_mph, na.rm = TRUE),
+    p25_speed = quantile(avg_speed_mph, probs = 0.25, type = 7, na.rm = TRUE, names = FALSE),
+    p75_speed = quantile(avg_speed_mph, probs = 0.75, type = 7, na.rm = TRUE, names = FALSE),
+    avg_vph = mean(total_flow_vph, na.rm = TRUE),
+    n_hours = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(speed_iqr = p75_speed - p25_speed)
+
+
+## GP period values ----
+
+gp_period <- period_summary %>%
+  filter(facility == "GP") %>%
+  select(
+    fiscal_year, analysis_month, direction, station_id, day_group, time_period,
+    avg_speed, p25_speed, p75_speed, speed_iqr, avg_vph
+  ) %>%
+  pivot_wider(
+    names_from = time_period,
+    values_from = c(avg_speed, p25_speed, p75_speed, speed_iqr, avg_vph),
+    names_glue = "{time_period}_{.value}"
+  ) %>%
+  rename(
+    gp_id = station_id,
+    
+    am_gp_speed = `AM Peak_avg_speed`,
+    am_gp_p25 = `AM Peak_p25_speed`,
+    am_gp_p75 = `AM Peak_p75_speed`,
+    am_gp_iqr = `AM Peak_speed_iqr`,
+    am_gp_vph = `AM Peak_avg_vph`,
+    
+    midday_gp_speed = `Midday_avg_speed`,
+    midday_gp_p25 = `Midday_p25_speed`,
+    midday_gp_p75 = `Midday_p75_speed`,
+    midday_gp_iqr = `Midday_speed_iqr`,
+    midday_gp_vph = `Midday_avg_vph`,
+    
+    pm_gp_speed = `PM Peak_avg_speed`,
+    pm_gp_p25 = `PM Peak_p25_speed`,
+    pm_gp_p75 = `PM Peak_p75_speed`,
+    pm_gp_iqr = `PM Peak_speed_iqr`,
+    pm_gp_vph = `PM Peak_avg_vph`
+  )
+
+
+## Express Lane period values ----
+
+el_period <- period_summary %>%
+  filter(facility == "Express Lane") %>%
+  select(
+    fiscal_year, analysis_month, direction, station_id, day_group, time_period,
+    avg_speed, p25_speed, p75_speed, speed_iqr, avg_vph
+  ) %>%
+  pivot_wider(
+    names_from = time_period,
+    values_from = c(avg_speed, p25_speed, p75_speed, speed_iqr, avg_vph),
+    names_glue = "{time_period}_{.value}"
+  ) %>%
+  rename(
+    el_id = station_id,
+    
+    am_el_speed = `AM Peak_avg_speed`,
+    am_el_p25 = `AM Peak_p25_speed`,
+    am_el_p75 = `AM Peak_p75_speed`,
+    am_el_iqr = `AM Peak_speed_iqr`,
+    am_el_vph = `AM Peak_avg_vph`,
+    
+    midday_el_speed = `Midday_avg_speed`,
+    midday_el_p25 = `Midday_p25_speed`,
+    midday_el_p75 = `Midday_p75_speed`,
+    midday_el_iqr = `Midday_speed_iqr`,
+    midday_el_vph = `Midday_avg_vph`,
+    
+    pm_el_speed = `PM Peak_avg_speed`,
+    pm_el_p25 = `PM Peak_p25_speed`,
+    pm_el_p75 = `PM Peak_p75_speed`,
+    pm_el_iqr = `PM Peak_speed_iqr`,
+    pm_el_vph = `PM Peak_avg_vph`
+  )
+
+
+# Section 9 - Full-day ADT ----
+#
+# ADT uses the selected healthy station-weeks but is calculated from the
+# available full-day hourly volume observations.
+#
+# We do not require 24 observed hours.
+# We do not scale a partial day.
+# We do not impute missing hours.
+
+
+## Valid hourly volume data ----
+
+adt_hourly <- selected_data %>%
+  mutate(station_id = as.character(station_id)) %>%
+  semi_join(
+    selected_station_ids %>% mutate(station_id = as.character(station_id)),
+    by = c("direction", "facility", "station_id")
+  ) %>%
+  filter(
+    !is.na(pct_observed),
+    pct_observed >= min_hour_pct_observed,
+    !is.na(samples),
+    samples > 0,
+    !is.na(total_flow_vph),
+    total_flow_vph >= 0
+  ) %>%
+  inner_join(
+    healthy_station_weeks,
+    by = c("week_start", "direction", "facility", "station_id")
+  )
+
+
+## QA check - duplicate station-hours ----
+#
+# Duplicates would double count volume so stop rather than continue.
+
+duplicate_hours <- adt_hourly %>%
+  count(date, hour, direction, facility, station_id) %>%
+  filter(n > 1)
+
+if (nrow(duplicate_hours) > 0) {
+  print(duplicate_hours, n = Inf)
+  stop("Duplicate station-hour records found. ADT calculation stopped.")
+}
+
+
+## Daily observed traffic totals ----
+
+daily_volume <- adt_hourly %>%
+  group_by(
+    fiscal_year,
+    analysis_month,
+    direction,
+    facility,
+    station_id,
+    day_group,
+    date
+  ) %>%
+  summarise(
+    hours_observed = n(),
+    daily_volume = sum(total_flow_vph, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+## Average observed daily traffic ----
+#
+# n_days and average hours observed are retained for QA even though they are
+# not shown in the final report.
+
+adt_summary <- daily_volume %>%
+  group_by(
+    fiscal_year,
+    analysis_month,
+    direction,
+    facility,
+    station_id,
+    day_group
+  ) %>%
+  summarise(
+    adt = mean(daily_volume, na.rm = TRUE),
+    n_days = n(),
+    avg_hours_observed = mean(hours_observed, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+### GP ADT ----
+
+gp_adt <- adt_summary %>%
+  filter(facility == "GP") %>%
+  transmute(
+    fiscal_year,
+    analysis_month,
+    direction,
+    day_group,
+    gp_id = as.character(station_id),
+    gp_adt = adt
+  )
+
+
+### Express Lane ADT ----
+
+el_adt <- adt_summary %>%
+  filter(facility == "Express Lane") %>%
+  transmute(
+    fiscal_year,
+    analysis_month,
+    direction,
+    day_group,
+    el_id = as.character(station_id),
+    el_adt = adt
+  )
+
+
+# Section 10 - Assemble final report data ----
+
+## Post Mile lookup ----
+#
+# Final rows are labeled and sorted using the Express Lane station Post Mile.
+
+pm_col <- intersect(
+  c("postmile", "post_mile", "abs_pm", "abs_postmile"),
+  names(i15_master)
+)[1]
+
+if (length(pm_col) == 0 || is.na(pm_col)) {
+  stop("Post mile column not found in i15_master.")
+}
+
+postmile_lookup <- i15_master %>%
+  filter(facility == "Express Lane") %>%
+  transmute(
+    el_id = as.character(station_id),
+    post_mile = as.numeric(.data[[pm_col]])
+  ) %>%
+  filter(!is.na(post_mile)) %>%
+  distinct(el_id, .keep_all = TRUE)
+
+
+## Master reporting table ----
+#
+# crossing() keeps the same table structure even when a period has no reportable
+# data. That is why some final cells are intentionally blank.
+
+station_pairs_reporting <- station_pairs %>%
+  mutate(
+    el_id = as.character(el_id),
+    gp_id = as.character(gp_id)
+  )
+
+report_master <- station_pairs_reporting %>%
+  crossing(
+    fiscal_year = fy_order,
+    analysis_month = month_order,
+    day_group = day_group_order
+  ) %>%
+  left_join(postmile_lookup, by = "el_id") %>%
+  left_join(
+    gp_period,
+    by = c("fiscal_year", "analysis_month", "direction", "gp_id", "day_group")
+  ) %>%
+  left_join(
+    el_period,
+    by = c("fiscal_year", "analysis_month", "direction", "el_id", "day_group")
+  ) %>%
+  left_join(
+    gp_adt,
+    by = c("fiscal_year", "analysis_month", "direction", "gp_id", "day_group")
+  ) %>%
+  left_join(
+    el_adt,
+    by = c("fiscal_year", "analysis_month", "direction", "el_id", "day_group")
+  ) %>%
+  mutate(
+    direction_label = case_when(
+      direction == "N" ~ "Northbound",
+      direction == "S" ~ "Southbound",
+      TRUE ~ direction
+    ),
+    
+    fiscal_year = factor(fiscal_year, levels = fy_order),
+    analysis_month = factor(analysis_month, levels = month_order),
+    day_group = factor(day_group, levels = day_group_order),
+    direction_label = factor(direction_label, levels = report_direction_order)
+  )
+
+
+## Report block helper ----
+#
+# Stations shown low to high Post Mile within each direction.
+
+get_report_block <- function(this_fy, this_month, this_day_group, this_direction) {
+  
+  report_master %>%
+    filter(
+      fiscal_year == this_fy,
+      analysis_month == this_month,
+      day_group == this_day_group,
+      direction_label == this_direction
+    ) %>%
+    arrange(post_mile)
+}
+
+
+# Section 11 - Final Excel workbook ----
+
+## Workbook setup ----
+
+report_output_file <- file.path(output_dir, "i15_reporting_tables.xlsx")
+report_wb <- createWorkbook()
+
+wrap_style <- createStyle(wrapText = TRUE, valign = "center")
+center_style <- createStyle(halign = "center", valign = "center")
+bold_style <- createStyle(textDecoration = "bold")
+
+
+## Speed cell helper ----
+#
+# IQR < 6 = numeric average only
+#
+# IQR >= 6 =
+#   Average
+#   (25th, 75th)
+#
+# A flagged speed cell has to be text because three values are displayed in
+# the same Excel cell. Other reported values stay numeric.
+
+write_speed_cell <- function(wb, sheet, row, col, avg_speed, p25, p75, iqr) {
+  
+  if (is.na(avg_speed)) return(invisible(NULL))
+  
+  if (!is.na(iqr) && iqr >= speed_iqr_threshold) {
+    
+    value <- paste0(
+      sprintf("%.1f", avg_speed),
+      "\n(",
+      sprintf("%.1f", p25),
+      ", ",
+      sprintf("%.1f", p75),
+      ")"
+    )
+    
+    writeData(
+      wb, sheet, value,
+      startRow = row,
+      startCol = col,
+      colNames = FALSE
+    )
+    
+  } else {
+    
+    writeData(
+      wb, sheet, round(avg_speed, 1),
+      startRow = row,
+      startCol = col,
+      colNames = FALSE
+    )
+  }
+}
+
+
+## Workbook headers ----
+
+column_headers <- c(
+  "Station",
+  "Post Mile",
+  "GP Speed\n(mph)",
+  "EL Speed\n(mph)",
+  "GP VPH",
+  "EL VPH",
+  "GP Speed\n(mph)",
+  "EL Speed\n(mph)",
+  "GP VPH",
+  "EL VPH",
+  "GP Speed\n(mph)",
+  "EL Speed\n(mph)",
+  "GP VPH",
+  "EL VPH",
+  "GP ADT",
+  "EL ADT"
+)
+
+
+## Day-group title helper ----
+
+get_day_group_title <- function(this_day_group) {
+  
+  case_when(
+    this_day_group == "Monday / Friday" ~ "Monday / Friday Average",
+    this_day_group == "Tuesday - Thursday" ~ "Tuesday-Thursday Average",
+    this_day_group == "Saturday / Sunday" ~ "Saturday / Sunday Average"
+  )
+}
+
+
+## Workbook structure ----
+#
+# One sheet per month
+# FY24, FY25, FY26 down each sheet
+# Three day groups within each FY
+# Northbound then Southbound
+# Stations low to high Post Mile
+
+for (this_month in month_order) {
+  
+  addWorksheet(report_wb, this_month)
+  current_row <- 1
+  
+  
+  ### Fiscal year blocks ----
+  
+  for (this_fy in fy_order) {
+    
+    writeData(
+      report_wb, this_month, this_fy,
+      startRow = current_row,
+      startCol = 1,
+      colNames = FALSE
+    )
+    
+    addStyle(
+      report_wb, this_month,
+      style = bold_style,
+      rows = current_row,
+      cols = 1
+    )
+    
+    current_row <- current_row + 2
+    
+    
+    ### Day-group blocks ----
+    
+    for (this_day_group in day_group_order) {
+      
+      writeData(
+        report_wb, this_month, get_day_group_title(this_day_group),
+        startRow = current_row,
+        startCol = 1,
+        colNames = FALSE
+      )
+      
+      addStyle(
+        report_wb, this_month,
+        style = bold_style,
+        rows = current_row,
+        cols = 1
+      )
+      
+      current_row <- current_row + 1
+      
+      
+      ### Grouped headers ----
+      
+      writeData(report_wb, this_month, "Station pair", startRow = current_row, startCol = 1, colNames = FALSE)
+      writeData(report_wb, this_month, "AM Peak (6:00-9:59 a.m.)", startRow = current_row, startCol = 3, colNames = FALSE)
+      writeData(report_wb, this_month, "Midday (10:00 a.m.-2:59 p.m.)", startRow = current_row, startCol = 7, colNames = FALSE)
+      writeData(report_wb, this_month, "PM Peak (3:00-6:59 p.m.)", startRow = current_row, startCol = 11, colNames = FALSE)
+      writeData(report_wb, this_month, "Full Day", startRow = current_row, startCol = 15, colNames = FALSE)
+      
+      mergeCells(report_wb, this_month, cols = 1:2, rows = current_row)
+      mergeCells(report_wb, this_month, cols = 3:6, rows = current_row)
+      mergeCells(report_wb, this_month, cols = 7:10, rows = current_row)
+      mergeCells(report_wb, this_month, cols = 11:14, rows = current_row)
+      mergeCells(report_wb, this_month, cols = 15:16, rows = current_row)
+      
+      addStyle(
+        report_wb, this_month,
+        style = center_style,
+        rows = current_row,
+        cols = 1:16,
+        gridExpand = TRUE
+      )
+      
+      current_row <- current_row + 1
+      
+      
+      ### Metric headers ----
+      
+      writeData(
+        report_wb, this_month, t(column_headers),
+        startRow = current_row,
+        startCol = 1,
+        colNames = FALSE
+      )
+      
+      addStyle(
+        report_wb, this_month,
+        style = wrap_style,
+        rows = current_row,
+        cols = 1:16,
+        gridExpand = TRUE
+      )
+      
+      addStyle(
+        report_wb, this_month,
+        style = bold_style,
+        rows = current_row,
+        cols = 1:16,
+        gridExpand = TRUE,
+        stack = TRUE
+      )
+      
+      current_row <- current_row + 1
+      
+      
+      ### Direction blocks ----
+      
+      for (this_direction in report_direction_order) {
+        
+        writeData(
+          report_wb, this_month, this_direction,
+          startRow = current_row,
+          startCol = 1,
+          colNames = FALSE
+        )
+        
+        addStyle(
+          report_wb, this_month,
+          style = bold_style,
+          rows = current_row,
+          cols = 1
+        )
+        
+        current_row <- current_row + 1
+        
+        this_table <- get_report_block(
+          this_fy,
+          this_month,
+          this_day_group,
+          this_direction
+        )
+        
+        
+        ### Station rows ----
+        
+        if (nrow(this_table) > 0) {
+          
+          for (j in seq_len(nrow(this_table))) {
+            
+            excel_row <- current_row + j - 1
+            
+            
+            # Station / Post Mile
+            
+            writeData(
+              report_wb, this_month, this_table$el_station[j],
+              startRow = excel_row, startCol = 1, colNames = FALSE
+            )
+            
+            if (!is.na(this_table$post_mile[j])) {
+              writeData(
+                report_wb, this_month, as.numeric(this_table$post_mile[j]),
+                startRow = excel_row, startCol = 2, colNames = FALSE
+              )
+            }
+            
+            
+            # AM
+            
+            write_speed_cell(
+              report_wb, this_month, excel_row, 3,
+              this_table$am_gp_speed[j],
+              this_table$am_gp_p25[j],
+              this_table$am_gp_p75[j],
+              this_table$am_gp_iqr[j]
+            )
+            
+            write_speed_cell(
+              report_wb, this_month, excel_row, 4,
+              this_table$am_el_speed[j],
+              this_table$am_el_p25[j],
+              this_table$am_el_p75[j],
+              this_table$am_el_iqr[j]
+            )
+            
+            if (!is.na(this_table$am_gp_vph[j])) {
+              writeData(
+                report_wb, this_month, round(this_table$am_gp_vph[j]),
+                startRow = excel_row, startCol = 5, colNames = FALSE
+              )
+            }
+            
+            if (!is.na(this_table$am_el_vph[j])) {
+              writeData(
+                report_wb, this_month, round(this_table$am_el_vph[j]),
+                startRow = excel_row, startCol = 6, colNames = FALSE
+              )
+            }
+            
+            
+            # Midday
+            
+            write_speed_cell(
+              report_wb, this_month, excel_row, 7,
+              this_table$midday_gp_speed[j],
+              this_table$midday_gp_p25[j],
+              this_table$midday_gp_p75[j],
+              this_table$midday_gp_iqr[j]
+            )
+            
+            write_speed_cell(
+              report_wb, this_month, excel_row, 8,
+              this_table$midday_el_speed[j],
+              this_table$midday_el_p25[j],
+              this_table$midday_el_p75[j],
+              this_table$midday_el_iqr[j]
+            )
+            
+            if (!is.na(this_table$midday_gp_vph[j])) {
+              writeData(
+                report_wb, this_month, round(this_table$midday_gp_vph[j]),
+                startRow = excel_row, startCol = 9, colNames = FALSE
+              )
+            }
+            
+            if (!is.na(this_table$midday_el_vph[j])) {
+              writeData(
+                report_wb, this_month, round(this_table$midday_el_vph[j]),
+                startRow = excel_row, startCol = 10, colNames = FALSE
+              )
+            }
+            
+            
+            # PM
+            
+            write_speed_cell(
+              report_wb, this_month, excel_row, 11,
+              this_table$pm_gp_speed[j],
+              this_table$pm_gp_p25[j],
+              this_table$pm_gp_p75[j],
+              this_table$pm_gp_iqr[j]
+            )
+            
+            write_speed_cell(
+              report_wb, this_month, excel_row, 12,
+              this_table$pm_el_speed[j],
+              this_table$pm_el_p25[j],
+              this_table$pm_el_p75[j],
+              this_table$pm_el_iqr[j]
+            )
+            
+            if (!is.na(this_table$pm_gp_vph[j])) {
+              writeData(
+                report_wb, this_month, round(this_table$pm_gp_vph[j]),
+                startRow = excel_row, startCol = 13, colNames = FALSE
+              )
+            }
+            
+            if (!is.na(this_table$pm_el_vph[j])) {
+              writeData(
+                report_wb, this_month, round(this_table$pm_el_vph[j]),
+                startRow = excel_row, startCol = 14, colNames = FALSE
+              )
+            }
+            
+            
+            # ADT
+            
+            if (!is.na(this_table$gp_adt[j])) {
+              writeData(
+                report_wb, this_month, round(this_table$gp_adt[j]),
+                startRow = excel_row, startCol = 15, colNames = FALSE
+              )
+            }
+            
+            if (!is.na(this_table$el_adt[j])) {
+              writeData(
+                report_wb, this_month, round(this_table$el_adt[j]),
+                startRow = excel_row, startCol = 16, colNames = FALSE
+              )
+            }
+          }
+          
+          
+          # Allows flagged speed cells to display on two lines
+          
+          addStyle(
+            report_wb, this_month,
+            style = wrap_style,
+            rows = current_row:(current_row + nrow(this_table) - 1),
+            cols = 1:16,
+            gridExpand = TRUE
+          )
+          
+          current_row <- current_row + nrow(this_table)
+        }
+      }
+      
+      current_row <- current_row + 2
+    }
+    
+    current_row <- current_row + 2
+  }
+}
+
+
+# Section 12 - Save final report ----
+
+saveWorkbook(
+  report_wb,
+  report_output_file,
+  overwrite = TRUE
+)
+
+cat("\nReporting workbook saved:\n", report_output_file, "\n")
